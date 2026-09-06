@@ -1,8 +1,15 @@
-// Owned tmux session identities and pure parsers for tmux output.
-// Subprocess operations live with the session operations built on top of this module.
+// Tmux session identities, pure output parsers, and the concrete subprocess
+// client for Zedra-owned sessions. Production discovers `tmux` on PATH; the
+// ignored lifecycle tests (`test(host): cover tmux session lifecycle`) inject
+// a binary path and a private `-L` socket instead.
 
-use anyhow::{bail, ensure, Context, Result};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{bail, ensure, Context as _, Result};
 use data_encoding::HEXLOWER;
+
+use crate::agent::utils::{command_output_with_timeout, shell_quote};
 
 /// Namespace prefix for tmux sessions created and terminated by Zedra.
 pub const OWNED_SESSION_PREFIX: &str = "zedra-pi-";
@@ -188,6 +195,292 @@ pub fn parse_pane_metadata(line: &str) -> Result<PaneMetadata> {
         current_path: current_path.to_string(),
         start_command: start_command.to_string(),
     })
+}
+// ---------------------------------------------------------------------------
+// Owned pane records and the concrete tmux client
+// ---------------------------------------------------------------------------
+
+/// One Zedra-owned session's live pane state, from [`TmuxClient::list_sessions`].
+#[derive(Debug, Clone)]
+pub struct OwnedPane {
+    pub session_id: String,
+    pub process: PaneProcess,
+    pub metadata: PaneMetadata,
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess client: concrete tmux operations on Zedra-owned sessions
+// ---------------------------------------------------------------------------
+
+/// Subprocess deadline for every tmux client call; tmux calls are local and
+/// fast, so a hung binary must never stall a resume or listing.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A discovered tmux client on a private socket.
+///
+/// Production constructs this with [`TmuxClient::discover`]; tests inject a
+/// binary path and socket name so they never touch the developer's server.
+#[derive(Debug, Clone)]
+pub struct TmuxClient {
+    binary: PathBuf,
+    socket: Option<String>,
+    version: TmuxVersion,
+}
+
+impl TmuxClient {
+    /// Discover `tmux` on `PATH` and verify it supports shared sessions.
+    ///
+    /// Returns the exact error a caller can surface, covering a missing
+    /// binary, unparsable `tmux -V` output, and releases below the minimum.
+    pub fn discover() -> Result<Self> {
+        ensure!(
+            crate::agent::utils::command_on_path("tmux"),
+            "tmux is not installed or not on PATH; install tmux {} or newer for shared agent sessions",
+            min_supported_version()
+        );
+        let client = Self::with_socket("tmux", None)?;
+        tracing::info!(version = %client.version, "tmux: client ready");
+        Ok(client)
+    }
+
+    /// Construct with an explicit binary path and optional private socket name.
+    /// Used directly by tests; the ignored lifecycle tests pass `-L` names.
+    pub fn with_socket(binary: impl AsRef<Path>, socket: Option<&str>) -> Result<Self> {
+        let mut client = Self {
+            binary: binary.as_ref().to_path_buf(),
+            socket: socket.map(str::to_string),
+            version: min_supported_version(),
+        };
+        client.probe_version()?;
+        Ok(client)
+    }
+
+    /// Verified tmux release, from the discovery probe.
+    pub fn version(&self) -> &TmuxVersion {
+        &self.version
+    }
+
+    /// Exact argv for a tmux subcommand: binary, private-socket selection,
+    /// then the subcommand and its arguments.
+    fn argv(&self, args: &[&str]) -> Vec<String> {
+        let mut argv = vec![self.binary.to_string_lossy().into_owned()];
+        if let Some(socket) = &self.socket {
+            argv.push("-L".to_string());
+            argv.push(socket.clone());
+        }
+        argv.extend(args.iter().map(|arg| arg.to_string()));
+        argv
+    }
+
+    fn probe_version(&mut self) -> Result<()> {
+        let output = self.run(&["-V"], "probe the tmux version")?;
+        self.version = supported_version(self.text(&output, "-V")?.as_str())?;
+        Ok(())
+    }
+
+    fn text(&self, output: &std::process::Output, what: &str) -> Result<String> {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            output.status.success(),
+            "tmux {what} failed with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+        String::from_utf8(output.stdout.clone())
+            .with_context(|| format!("tmux {what} produced non-UTF-8 output"))
+    }
+
+    fn run(&self, args: &[&str], what: &str) -> Result<std::process::Output> {
+        let argv = self.argv(args);
+        let (program, rest) = argv.split_first().context("tmux argv is never empty")?;
+        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+        command_output_with_timeout(program, &rest, None, COMMAND_TIMEOUT)
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .with_context(|| format!("tmux {what}"))
+    }
+
+    /// A successful run's decoded stdout; failures carry stderr context.
+    fn run_ok(&self, args: &[&str], what: &str) -> Result<String> {
+        let output = self.run(args, what)?;
+        self.text(&output, what)
+    }
+
+    /// Prepare or attach to the owned session for `session_id`.
+    ///
+    /// Runs `new-session -d -A` headless: an existing target ignores the inner
+    /// command, so concurrent prepares start exactly one inner process. Sets
+    /// session-scoped `mouse on` and `window-size largest` afterwards.
+    /// Returns the command a terminal should run to attach.
+    pub fn prepare_session(
+        &self,
+        session_id: &str,
+        workdir: &Path,
+        resume_command: &str,
+    ) -> Result<String> {
+        let name = owned_session_name(session_id)?;
+        let workdir = workdir.to_str().context("workdir is not UTF-8")?;
+        let args = [
+            "new-session",
+            "-d",
+            "-A",
+            "-s",
+            &name,
+            "-c",
+            workdir,
+            resume_command,
+        ];
+        let output = self.run(&args, "prepare the shared session")?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let already_prepared = !output.status.success()
+            && output.status.code() == Some(1)
+            && stderr.contains("open terminal failed: not a terminal");
+        // Headless attach races on an existing session fail with exactly this
+        // message; the winner already created or attached the session.
+        ensure!(
+            output.status.success() || already_prepared,
+            "tmux prepare the shared session failed with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+        // A fresh socket can transiently fail to connect while the server
+        // (started by this very call) is still binding; one retry resolves it.
+        if !output.status.success() {
+            let retry = self.run(&args, "prepare the shared session (retry)")?;
+            ensure!(
+                retry.status.success(),
+                "tmux prepare the shared session failed (retry): {}",
+                String::from_utf8_lossy(&retry.stderr).trim()
+            );
+        }
+        // Session-scoped options: other sessions keep their own values.
+        self.run_ok(&["set-option", "-t", &name, "mouse", "on"], "set mouse")?;
+        self.run_ok(
+            &["set-option", "-t", &name, "window-size", "largest"],
+            "set window-size",
+        )?;
+        Ok(self.attach_command(&name))
+    }
+
+    /// List the Zedra-owned sessions on this socket with their first pane's
+    /// process and metadata state. Foreign and malformed sessions are untracked
+    /// and omitted; an owned session whose pane data cannot be read is skipped
+    /// rather than poisoning the whole listing.
+    pub fn list_sessions(&self) -> Result<Vec<OwnedPane>> {
+        let Some(session_text) = self.list_session_names()? else {
+            return Ok(Vec::new());
+        };
+        let mut sessions = Vec::new();
+        for name in session_text.lines() {
+            let name = name.trim();
+            let SessionOwnership::Owned { session_id } = session_ownership(name) else {
+                continue;
+            };
+            let Ok(process_text) = self.run_ok(
+                &["list-panes", "-t", name, "-F", PROCESS_PANE_FORMAT],
+                "list panes",
+            ) else {
+                continue;
+            };
+            let Ok(metadata_text) = self.run_ok(
+                &["list-panes", "-t", name, "-F", METADATA_PANE_FORMAT],
+                "list panes",
+            ) else {
+                continue;
+            };
+            let Some(process_line) = process_text.lines().next() else {
+                continue;
+            };
+            let Ok(process) = parse_pane_process(process_line) else {
+                continue;
+            };
+            let Some(metadata_line) = metadata_text.lines().next() else {
+                continue;
+            };
+            let Ok(metadata) = parse_pane_metadata(metadata_line) else {
+                continue;
+            };
+            sessions.push(OwnedPane {
+                session_id,
+                process,
+                metadata,
+            });
+        }
+        Ok(sessions)
+    }
+
+    /// The no-server case is the documented "available capability, empty list"
+    /// signal, not an error.
+    fn list_session_names(&self) -> Result<Option<String>> {
+        let output = self.run(&["list-sessions", "-F", "#{session_name}"], "list sessions")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if Self::is_no_server(&stderr) {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "tmux list sessions failed with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        String::from_utf8(output.stdout.clone())
+            .map(Some)
+            .context("tmux list sessions produced non-UTF-8 output")
+    }
+
+    /// Both proven fresh-socket stderr variants mean no server, not a broken
+    /// client: "no server running on <path>" and "error connecting to <path>
+    /// (No such file or directory)".
+    fn is_no_server(stderr: &str) -> bool {
+        stderr.contains("no server running on ")
+            || stderr.contains("error connecting to ")
+                && stderr.contains("No such file or directory")
+    }
+
+    /// Terminate the owned session rebuilt from `(slug, session_id)`.
+    ///
+    /// Accepts only the owning slug and an owned-namespace target derived by
+    /// the codec — never a raw tmux name. An already-vanished session counts
+    /// as terminated.
+    pub fn terminate_session(&self, slug: &str, session_id: &str) -> Result<()> {
+        // The `zedra-pi-` prefix is Pi's namespace; another agent needs its own.
+        ensure!(
+            slug == "pi",
+            "agent {slug:?} does not own shared tmux sessions"
+        );
+        let name = owned_session_name(session_id)?;
+        let output = self.run(
+            &["kill-session", "-t", &name],
+            "terminate the shared session",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Concurrent termination or a dead server already did the work.
+            ensure!(
+                stderr.contains("can't find session:"),
+                "tmux terminate the shared session failed with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// The command a terminal runs to attach: exec tmux, optionally select the
+    /// private socket, attach the owned target, and exit with tmux's status so
+    /// a failed attach does not leave a login shell behind.
+    pub fn attach_command(&self, name: &str) -> String {
+        let binary = shell_quote(&self.binary.to_string_lossy());
+        let socket = self
+            .socket
+            .as_deref()
+            .map(|socket| format!("-L {} ", shell_quote(socket)))
+            .unwrap_or_default();
+        format!(
+            "exec {binary} {socket}attach-session -t {} || exit $?",
+            shell_quote(name)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -382,4 +675,5 @@ mod tests {
             assert!(parse_pane_metadata(line).is_err(), "line: {line:?}");
         }
     }
+
 }
