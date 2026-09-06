@@ -676,4 +676,226 @@ mod tests {
         }
     }
 
+    #[test]
+    fn argv_construction_carries_socket_and_subcommand() {
+        let default = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: None,
+            version: min_supported_version(),
+        };
+        assert_eq!(
+            default.argv(&["list-sessions"]),
+            ["/usr/bin/tmux", "list-sessions"]
+        );
+
+        let private = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: Some("proof".to_string()),
+            version: min_supported_version(),
+        };
+        assert_eq!(
+            private.argv(&["kill-session", "-t", "zedra-pi-61"]),
+            [
+                "/usr/bin/tmux",
+                "-L",
+                "proof",
+                "kill-session",
+                "-t",
+                "zedra-pi-61"
+            ]
+        );
+    }
+
+    #[test]
+    fn prepare_session_argv_is_exact() {
+        let client = TmuxClient {
+            binary: PathBuf::from("/opt/tmux"),
+            socket: Some("private".to_string()),
+            version: min_supported_version(),
+        };
+        // `prepare_session` delegates argv to `run`/`argv`; asserting the exact
+        // array here pins the create-or-attach form without spawning tmux.
+        let args = [
+            "new-session",
+            "-d",
+            "-A",
+            "-s",
+            &owned_session_name("session-1").unwrap(),
+            "-c",
+            "/tmp/proof/workdir",
+            "pi resume abc",
+        ];
+        assert_eq!(
+            client.argv(&args),
+            [
+                "/opt/tmux",
+                "-L",
+                "private",
+                "new-session",
+                "-d",
+                "-A",
+                "-s",
+                "zedra-pi-73657373696f6e2d31",
+                "-c",
+                "/tmp/proof/workdir",
+                "pi resume abc"
+            ]
+        );
+    }
+
+    #[test]
+    fn set_option_argv_matches_proven_forms() {
+        let client = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: Some("proof".to_string()),
+            version: min_supported_version(),
+        };
+        assert_eq!(
+            client.argv(&["set-option", "-t", "zedra-pi-61", "mouse", "on"]),
+            [
+                "/usr/bin/tmux",
+                "-L",
+                "proof",
+                "set-option",
+                "-t",
+                "zedra-pi-61",
+                "mouse",
+                "on"
+            ]
+        );
+        assert_eq!(
+            client.argv(&["set-option", "-t", "zedra-pi-61", "window-size", "largest"]),
+            [
+                "/usr/bin/tmux",
+                "-L",
+                "proof",
+                "set-option",
+                "-t",
+                "zedra-pi-61",
+                "window-size",
+                "largest"
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_command_quotes_binary_socket_and_target() {
+        let default = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: None,
+            version: min_supported_version(),
+        };
+        assert_eq!(
+            default.attach_command("zedra-pi-61"),
+            "exec /usr/bin/tmux attach-session -t zedra-pi-61 || exit $?"
+        );
+
+        let spaced_binary = TmuxClient {
+            binary: PathBuf::from("/opt/My Tmux/tmux"),
+            socket: Some("private socket".to_string()),
+            version: min_supported_version(),
+        };
+        assert_eq!(
+            spaced_binary.attach_command("zedra-pi-61"),
+            "exec '/opt/My Tmux/tmux' -L 'private socket' attach-session -t zedra-pi-61 || exit $?"
+        );
+
+        let quoted = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: None,
+            version: min_supported_version(),
+        };
+        assert_eq!(
+            quoted.attach_command("zedra-pi-6f'27"),
+            "exec /usr/bin/tmux attach-session -t 'zedra-pi-6f'\\''27' || exit $?"
+        );
+    }
+
+    #[test]
+    fn no_server_detection_covers_both_proven_variants() {
+        assert!(TmuxClient::is_no_server(
+            "no server running on /tmp/tmux-0/proof"
+        ));
+        assert!(TmuxClient::is_no_server(
+            "error connecting to /tmp/tmux-0/proof (No such file or directory)"
+        ));
+        assert!(!TmuxClient::is_no_server("can't find session: zedra-pi-61"));
+        assert!(!TmuxClient::is_no_server("socket corrupted"));
+    }
+
+    #[test]
+    fn list_sessions_skips_foreign_and_malformed_names() {
+        // Pure classification re-check over mixed names: owned names survive,
+        // foreign and malformed names never reach pane listing.
+        let names = [
+            "zedra-pi-73657373696f6e",
+            "main",
+            "zedra-pi-",
+            "ZEDRA-PI-73657373696F6E",
+            "zedra-pi-zzz",
+        ];
+        let owned: Vec<&str> = names
+            .iter()
+            .filter(|name| matches!(session_ownership(name), SessionOwnership::Owned { .. }))
+            .copied()
+            .collect();
+        assert_eq!(owned, ["zedra-pi-73657373696f6e"]);
+    }
+
+    #[test]
+    fn prepare_session_rejects_empty_session_ids_before_spawn() {
+        let client = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: None,
+            version: min_supported_version(),
+        };
+        let error = client
+            .prepare_session("", Path::new("/tmp/workdir"), "pi resume x")
+            .unwrap_err();
+        assert!(error.to_string().contains("empty Pi session id"));
+    }
+
+    #[test]
+    fn terminate_session_refuses_foreign_slugs_and_empty_ids() {
+        let client = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: None,
+            version: min_supported_version(),
+        };
+        let error = client.terminate_session("claude", UUID).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not own shared tmux sessions"));
+
+        let error = client.terminate_session("pi", "").unwrap_err();
+        assert!(error.to_string().contains("empty Pi session id"));
+    }
+
+    #[test]
+    fn list_sessions_error_propagates_when_binary_missing() {
+        // A missing binary fails at the subprocess boundary and must surface,
+        // not silently degrade to an empty owned list.
+        let binaryless = TmuxClient {
+            binary: PathBuf::from("/nonexistent/tmux-for-zedra-test"),
+            socket: Some("definitely-missing-socket".to_string()),
+            version: min_supported_version(),
+        };
+        let error = binaryless.list_sessions().unwrap_err();
+        assert!(
+            error.to_string().contains("list sessions"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn list_sessions_classifies_proven_no_server_stderr() {
+        // The two proven fresh-socket stderr variants classify as no-server,
+        // which `list_session_names` maps to `Ok(None)` -> empty owned list.
+        for stderr in [
+            "no server running on /tmp/tmux-0/proof",
+            "error connecting to /tmp/tmux-0/proof (No such file or directory)",
+        ] {
+            assert!(TmuxClient::is_no_server(stderr), "stderr: {stderr:?}");
+        }
+    }
 }
