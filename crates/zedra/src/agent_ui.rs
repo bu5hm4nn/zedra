@@ -896,3 +896,114 @@ fn day_label(at: Option<DateTime<Utc>>) -> String {
         at.format("%A, %b %d").to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AgentSessionItem, AgentSessionSummary, AgentShareSession, group_sessions_by_day,
+        merge_shared_sessions,
+    };
+    use chrono::Utc;
+    use zedra_rpc::proto::AgentResumeSummary;
+
+    fn summary(slug: &str, id: &str, hours_ago: i64) -> AgentSessionSummary {
+        let at = Utc::now() - chrono::Duration::hours(hours_ago);
+        AgentSessionSummary {
+            slug: slug.into(),
+            session_id: id.into(),
+            title: None,
+            cwd: None,
+            created_at: Some(at),
+            last_activity_at: Some(at),
+            resume: AgentResumeSummary {
+                available: true,
+                unavailable_reason: None,
+                action_id: None,
+            },
+            git: None,
+            usage: None,
+            transcript_size_bytes: None,
+        }
+    }
+
+    fn share(id: &str, dead: bool) -> AgentShareSession {
+        AgentShareSession {
+            session_id: id.into(),
+            title: Some("live".into()),
+            cwd: None,
+            current_command: None,
+            dead,
+            exit_code: dead.then_some(7),
+        }
+    }
+
+    #[test]
+    fn merge_groups_by_persisted_times_and_attaches_only_own_live_shares() {
+        let older = summary("pi", "old", 48);
+        let newer = summary("pi", "new", 1);
+        let foreign = summary("hermes", "other", 2);
+        let shares = vec![share("old", false), share("other", false)];
+
+        let sections = group_sessions_by_day(merge_shared_sessions(
+            vec![older, newer, foreign],
+            "pi",
+            &shares,
+        ));
+        let items: Vec<&AgentSessionItem> = sections
+            .iter()
+            .flat_map(|section| section.sessions.iter())
+            .collect();
+
+        // Newest first by persisted times; the live "old" row stays last, and
+        // the foreign-slug row never picks up a share from the Pi snapshot.
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item.session.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["new", "other", "old"]);
+        assert_eq!(
+            items[2].shared.as_ref().map(|s| s.session_id.as_str()),
+            Some("old")
+        );
+        assert!(items[0].shared.is_none() && items[1].shared.is_none());
+    }
+
+    #[test]
+    fn merge_keeps_dead_panes_attached_with_exit_code() {
+        let items =
+            merge_shared_sessions(vec![summary("pi", "dead", 3)], "pi", &[share("dead", true)]);
+        let shared = items[0].shared.as_ref().expect("dead pane still shared");
+        assert!(shared.dead);
+        assert_eq!(shared.exit_code, Some(7));
+    }
+
+    #[test]
+    fn merge_never_fabricates_history_for_unlisted_shares() {
+        let row = summary("pi", "known", 3);
+        let items = merge_shared_sessions(
+            vec![row.clone()],
+            "pi",
+            &[share("known", false), share("ghost", false)],
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].session, row);
+    }
+
+    #[test]
+    fn merge_collapses_duplicate_snapshot_entries_to_first() {
+        let mut duplicate = share("dup", false);
+        duplicate.title = Some("second".into());
+
+        let items = merge_shared_sessions(
+            vec![summary("pi", "dup", 3)],
+            "pi",
+            &[share("dup", false), duplicate],
+        );
+
+        assert_eq!(
+            items[0].shared.as_ref().unwrap().title.as_deref(),
+            Some("live")
+        );
+    }
+}

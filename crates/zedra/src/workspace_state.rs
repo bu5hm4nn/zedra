@@ -1110,6 +1110,19 @@ mod tests {
                 state: AgentState::Running,
                 path: "/session/1".into(),
             }],
+            shared_sessions: vec![AgentSharedSessions {
+                slug: "pi".into(),
+                available: true,
+                sessions: vec![AgentShareSession {
+                    session_id: "s1".into(),
+                    title: None,
+                    cwd: None,
+                    current_command: None,
+                    dead: false,
+                    exit_code: None,
+                }],
+                logged_unavailable: None,
+            }],
             ..Default::default()
         };
 
@@ -1124,6 +1137,94 @@ mod tests {
         assert!(state.terminal_ids.is_empty());
         assert_eq!(state.host_info, None);
         assert!(state.web_clients.is_empty());
+        assert!(state.shared_sessions.is_empty());
+    }
+
+    #[test]
+    fn shared_session_polls_replace_snapshot_and_warn_once_per_stretch() {
+        use gpui::{AppContext as _, TestAppContext};
+
+        let live = AgentShareListResult {
+            available: true,
+            version: "3.3a".into(),
+            sessions: vec![AgentShareSession {
+                session_id: "s1".into(),
+                title: Some("t".into()),
+                cwd: None,
+                current_command: None,
+                dead: false,
+                exit_code: None,
+            }],
+            error: None,
+        };
+        let unavailable = AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some("no usable tmux".into()),
+        };
+
+        let mut cx = TestAppContext::single();
+        let state = cx.update(|cx| cx.new(|_cx| WorkspaceState::default()));
+
+        assert!(
+            state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "pi",
+                Ok(&live),
+                cx
+            ))
+        );
+        // The identical snapshot again: no change, no observers notified.
+        assert!(
+            !state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "pi",
+                Ok(&live),
+                cx
+            ))
+        );
+
+        // Unavailable result clears shares and is remembered as logged once;
+        // becoming available again resets the one-warning-per-stretch guard.
+        assert!(
+            state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "pi",
+                Ok(&unavailable),
+                cx
+            ))
+        );
+        let entry = state.update(&mut cx, |state, _| {
+            state.shared_sessions("pi").unwrap().clone()
+        });
+        assert!(!entry.available);
+        assert!(entry.sessions.is_empty());
+        assert_eq!(entry.logged_unavailable.as_deref(), Some("no usable tmux"));
+        assert!(
+            state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "pi",
+                Ok(&live),
+                cx
+            ))
+        );
+        assert_eq!(
+            state.update(&mut cx, |state, _| state
+                .shared_sessions("pi")
+                .unwrap()
+                .logged_unavailable
+                .clone()),
+            None
+        );
+
+        // Removing a share drops exactly that session id (termination path);
+        // an id outside the snapshot reports no change.
+        assert!(!state.update(&mut cx, |state, cx| {
+            state.remove_shared_session("pi", "s2", cx)
+        }));
+        assert!(state.update(&mut cx, |state, cx| {
+            state.remove_shared_session("pi", "s1", cx)
+        }));
+        assert!(state.update(&mut cx, |state, _| {
+            state.shared_sessions("pi").unwrap().sessions.is_empty()
+        }));
     }
 
     #[test]
