@@ -1,11 +1,13 @@
 use gpui::*;
 use std::rc::Rc;
 use tracing::error;
+use zedra_rpc::proto::AgentSessionSummary;
 use zedra_session::SessionHandle;
 
 use crate::agent_ui::{
-    AgentSessionRow, flatten_session_sections, group_sessions_by_day, new_session_list_state,
-    render_virtualized_agent_session_list, reset_session_list_state,
+    AgentSessionRow, SHARED_SESSION_AGENT_SLUG, SharedSessionPollHandle, flatten_session_sections,
+    group_sessions_by_day, merge_shared_sessions, new_session_list_state,
+    render_virtualized_agent_session_list, reset_session_list_state, spawn_shared_session_poll,
 };
 use crate::fonts;
 use crate::platform_bridge::{self, HapticFeedback};
@@ -15,6 +17,7 @@ use crate::ui::{
     subscreen_refresh_button,
 };
 use crate::workspace_action;
+use crate::workspace_state::WorkspaceState;
 
 #[derive(Clone, Debug)]
 enum LoadState {
@@ -25,22 +28,39 @@ enum LoadState {
 
 pub struct AgentSessions {
     session_handle: SessionHandle,
+    workspace_state: Entity<WorkspaceState>,
+    /// Persisted rows from the last load, for re-merging with fresh shares.
+    sessions: Vec<AgentSessionSummary>,
     rows: Rc<Vec<AgentSessionRow>>,
     list_state: ListState,
     load_state: LoadState,
     loading_epoch: u64,
+    shared_poll: Option<SharedSessionPollHandle>,
     _tasks: Vec<Task<()>>,
 }
 
 impl AgentSessions {
-    pub fn new(session_handle: SessionHandle, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session_handle: SessionHandle,
+        workspace_state: Entity<WorkspaceState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (poll_task, poll_handle) = spawn_shared_session_poll(
+            session_handle.clone(),
+            workspace_state.clone(),
+            |this, cx| this.rebuild_rows(cx),
+            cx,
+        );
         let mut view = Self {
             session_handle,
+            workspace_state,
+            sessions: Vec::new(),
             rows: Rc::new(Vec::new()),
             list_state: new_session_list_state(0),
             load_state: LoadState::Loading,
             loading_epoch: 0,
-            _tasks: Vec::new(),
+            shared_poll: Some(poll_handle),
+            _tasks: vec![poll_task],
         };
         view.load(false, cx);
         view
@@ -84,7 +104,8 @@ impl AgentSessions {
                 if this.loading_epoch != epoch {
                     return;
                 }
-                this.set_rows(flatten_session_sections(group_sessions_by_day(sessions)));
+                this.sessions = sessions;
+                this.rebuild_rows(cx);
                 this.load_state = if errors.is_empty() {
                     LoadState::Ready
                 } else if this.rows.is_empty() {
@@ -104,6 +125,36 @@ impl AgentSessions {
     fn set_rows(&mut self, rows: Vec<AgentSessionRow>) {
         reset_session_list_state(&self.list_state, rows.len());
         self.rows = Rc::new(rows);
+    }
+
+    /// Manual refresh: reload history and nudge the live-share poll.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        if let Some(poll) = &self.shared_poll {
+            poll.request_refresh();
+        }
+        self.load(true, cx);
+    }
+
+    /// Re-derive rows from persisted sessions plus the live tmux snapshot
+    /// (poll callback); resets the list state only when the count changes.
+    fn rebuild_rows(&mut self, cx: &mut Context<Self>) {
+        let shares = self
+            .workspace_state
+            .read(cx)
+            .shared_sessions(SHARED_SESSION_AGENT_SLUG)
+            .map(|entry| entry.sessions.clone())
+            .unwrap_or_default();
+        let rows = flatten_session_sections(group_sessions_by_day(merge_shared_sessions(
+            self.sessions.clone(),
+            SHARED_SESSION_AGENT_SLUG,
+            &shares,
+        )));
+        if rows.len() == self.rows.len() {
+            self.rows = Rc::new(rows);
+        } else {
+            self.set_rows(rows);
+        }
+        cx.notify();
     }
 }
 
@@ -178,7 +229,7 @@ fn render_session_header(cx: &mut Context<AgentSessions>) -> impl IntoElement {
                 .child(subscreen_refresh_button(
                     "agent-sessions-refresh-btn",
                     cx,
-                    |this, _event, _window, cx| this.load(true, cx),
+                    |this, _event, _window, cx| this.refresh(cx),
                 )),
         )
 }

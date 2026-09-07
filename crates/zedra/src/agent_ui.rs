@@ -1,14 +1,20 @@
 //! Shared agent cards, session list, and display helpers (not navigation-stack views).
 use chrono::{DateTime, Utc};
+use futures::{FutureExt, StreamExt, future, pin_mut};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 use zedra_rpc::proto::{
-    AgentInfoField, AgentSessionSummary, AgentSetupState, AgentSummary, AgentUsageSnapshot,
+    AgentInfoField, AgentSessionSummary, AgentSetupState, AgentShareSession, AgentSummary,
+    AgentUsageSnapshot,
 };
+use zedra_session::SessionHandle;
 
 use crate::fonts;
 use crate::platform_bridge::{self, HapticFeedback};
+use crate::workspace_state::WorkspaceState;
 use crate::{theme, workspace_action};
 
 // Enough offscreen rows to keep fast mobile scrolls smooth without measuring
@@ -44,6 +50,114 @@ pub fn setup_label(state: AgentSetupState) -> &'static str {
         AgentSetupState::HooksReady => "Hooks ready",
         AgentSetupState::Error => "Error",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared tmux sessions (Pi)
+// ---------------------------------------------------------------------------
+
+/// Only agents with the host-side shared-session capability are polled; Pi
+/// is the only one today.
+pub const SHARED_SESSION_AGENT_SLUG: &str = "pi";
+
+/// Interval between tmux snapshots while a sessions view is open.
+const SHARED_SESSION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One persisted session row plus its live tmux share, when listed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSessionItem {
+    pub session: AgentSessionSummary,
+    pub shared: Option<AgentShareSession>,
+}
+
+/// Pair persisted history with the live tmux snapshot by `(slug, session_id)`.
+/// Pure: rows keep their order and timestamps; shares without a persisted row
+/// are dropped (never fabricated), and duplicate entries collapse to the first.
+pub fn merge_shared_sessions(
+    sessions: Vec<AgentSessionSummary>,
+    slug: &str,
+    shares: &[AgentShareSession],
+) -> Vec<AgentSessionItem> {
+    sessions
+        .into_iter()
+        .map(|session| {
+            let shared = if session.slug == slug {
+                shares
+                    .iter()
+                    .find(|share| share.session_id == session.session_id)
+                    .cloned()
+            } else {
+                None
+            };
+            AgentSessionItem { session, shared }
+        })
+        .collect()
+}
+
+/// Wake handle nudging the poll to refresh right away; full/closed channels
+/// are no-ops.
+#[derive(Clone)]
+pub struct SharedSessionPollHandle {
+    wake: Rc<RefCell<futures::channel::mpsc::Sender<()>>>,
+}
+
+impl SharedSessionPollHandle {
+    pub fn request_refresh(&self) {
+        let _ = self.wake.borrow_mut().try_send(());
+    }
+}
+
+/// Poll `AgentShareList` for [`SHARED_SESSION_AGENT_SLUG`] while the owning
+/// view lives. Requests never overlap: the next fires only after the previous
+/// response is applied and the interval elapses — or a wake arrives early.
+/// Cancels when the view drops the `Task`; `on_snapshot` re-derives display
+/// rows after a changed snapshot.
+pub fn spawn_shared_session_poll<T, F>(
+    session_handle: SessionHandle,
+    workspace_state: Entity<WorkspaceState>,
+    on_snapshot: F,
+    cx: &mut Context<T>,
+) -> (Task<()>, SharedSessionPollHandle)
+where
+    T: 'static,
+    F: Fn(&mut T, &mut Context<T>) + 'static,
+{
+    let (wake, mut wake_rx) = futures::channel::mpsc::channel::<()>(1);
+    let task = cx.spawn(async move |this, cx| {
+        loop {
+            let listing = session_handle
+                .agent_share_list(SHARED_SESSION_AGENT_SLUG.to_string())
+                .await;
+            let applied = this.update(cx, |this, cx| {
+                let changed = workspace_state.update(cx, |state, cx| {
+                    state.apply_shared_sessions(SHARED_SESSION_AGENT_SLUG, listing.as_ref(), cx)
+                });
+                if changed {
+                    on_snapshot(this, cx);
+                }
+            });
+            if applied.is_err() {
+                break;
+            }
+            let sleep = cx
+                .background_executor()
+                .timer(SHARED_SESSION_POLL_INTERVAL)
+                .fuse();
+            let wake = wake_rx.next().fuse();
+            pin_mut!(sleep, wake);
+            match future::select(sleep, wake).await {
+                future::Either::Left(_) => {}
+                future::Either::Right((Some(()), _)) => continue,
+                future::Either::Right((None, _)) => break,
+            }
+        }
+    });
+    (
+        task,
+        SharedSessionPollHandle {
+            wake: Rc::new(RefCell::new(wake)),
+        },
+    )
 }
 
 pub fn short_id(id: &str) -> String {
@@ -596,21 +710,22 @@ fn format_session_time(at: DateTime<Utc>) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentSessionSection {
     pub label: String,
-    pub sessions: Vec<AgentSessionSummary>,
+    pub sessions: Vec<AgentSessionItem>,
 }
 
-pub fn group_sessions_by_day(sessions: Vec<AgentSessionSummary>) -> Vec<AgentSessionSection> {
+pub fn group_sessions_by_day(sessions: Vec<AgentSessionItem>) -> Vec<AgentSessionSection> {
     let mut sorted = sessions;
     sorted.sort_by(|left, right| {
         right
+            .session
             .last_activity_at
-            .cmp(&left.last_activity_at)
-            .then_with(|| right.created_at.cmp(&left.created_at))
+            .cmp(&left.session.last_activity_at)
+            .then_with(|| right.session.created_at.cmp(&left.session.created_at))
     });
 
     let mut sections = Vec::new();
-    for session in sorted {
-        let label = day_label(session.last_activity_at.or(session.created_at));
+    for item in sorted {
+        let label = day_label(item.session.last_activity_at.or(item.session.created_at));
         if sections
             .last()
             .is_some_and(|section: &AgentSessionSection| section.label == label)
@@ -619,11 +734,11 @@ pub fn group_sessions_by_day(sessions: Vec<AgentSessionSummary>) -> Vec<AgentSes
                 .last_mut()
                 .expect("section exists")
                 .sessions
-                .push(session);
+                .push(item);
         } else {
             sections.push(AgentSessionSection {
                 label,
-                sessions: vec![session],
+                sessions: vec![item],
             });
         }
     }
@@ -662,10 +777,10 @@ pub fn render_agent_session_list(props: AgentSessionListProps<'_>, cx: &App) -> 
 
     for section in props.sections {
         list = list.child(section_header(&section.label, cx));
-        for session in &section.sessions {
+        for item in &section.sessions {
             list = list.child(render_session_card(
                 SessionCardProps {
-                    session,
+                    session: &item.session,
                     resume_on_tap: props.resume_on_tap,
                 },
                 cx,
@@ -678,7 +793,7 @@ pub fn render_agent_session_list(props: AgentSessionListProps<'_>, cx: &App) -> 
 /// One virtualized row: either a day header or a session card.
 pub enum AgentSessionRow {
     Header(SharedString),
-    Session(AgentSessionSummary),
+    Session(AgentSessionItem),
 }
 
 pub fn flatten_session_sections(sections: Vec<AgentSessionSection>) -> Vec<AgentSessionRow> {
@@ -724,9 +839,9 @@ pub fn render_virtualized_agent_session_list(
         };
         let content = match row {
             AgentSessionRow::Header(label) => section_header(label, cx).into_any_element(),
-            AgentSessionRow::Session(session) => render_session_card(
+            AgentSessionRow::Session(item) => render_session_card(
                 SessionCardProps {
-                    session,
+                    session: &item.session,
                     resume_on_tap,
                 },
                 cx,

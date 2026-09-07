@@ -2174,7 +2174,13 @@ impl Workspace {
                 }
             }
             WorkspaceMainView::AgentSessions => {
-                let view = cx.new(|cx| AgentSessions::new(self.session.handle().clone(), cx));
+                let view = cx.new(|cx| {
+                    AgentSessions::new(
+                        self.session.handle().clone(),
+                        self.workspace_state.clone(),
+                        cx,
+                    )
+                });
                 self.content.update(cx, move |content, cx| {
                     content.clear_subtitle(cx);
                     content.set_main_view(view.into(), cx);
