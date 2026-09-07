@@ -4271,3 +4271,210 @@ pub(crate) fn os_version_string() -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod shared_resume_tests {
+    use super::*;
+    use crate::pty::SharedSpawnIdentity;
+    use crate::session_registry::SessionRegistry;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn identity(slug: &str, session_id: &str) -> SharedSpawnIdentity {
+        SharedSpawnIdentity {
+            slug: slug.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// Terminals whose PTY child exits on its own: reaping is then instant
+    /// and hermetic, independent of the real login shell's profile.
+    fn terminal(shared: Option<SharedSpawnIdentity>) -> TermSession {
+        let shell = ShellSession::spawn(
+            80,
+            24,
+            SpawnOptions {
+                launch_cmd: Some("exit 0".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_reader, writer, master, child) = shell.take_reader();
+        TermSession {
+            writer: Arc::new(std::sync::Mutex::new(writer)),
+            master,
+            child,
+            output_sender: Arc::new(std::sync::Mutex::new(OutputSenderSlot {
+                gen: 0,
+                sender: None,
+            })),
+            host_meta: Arc::new(std::sync::Mutex::new(HostTermMeta::default())),
+            backlog: Arc::new(std::sync::Mutex::new(TermBacklog::new())),
+            created_at: std::time::SystemTime::now(),
+            started_at: std::time::Instant::now(),
+            shared,
+        }
+    }
+
+    async fn session() -> Arc<ServerSession> {
+        SessionRegistry::new()
+            .create_named("shared-resume-test", PathBuf::from("/tmp"))
+            .await
+    }
+
+    /// Executable stub `tmux` binary (never a real server) whose `-V`
+    /// behavior comes from `script`.
+    fn stub_tmux(name: &str, script: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("zedra-{name}-{}", std::process::id()));
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn shared_terminals_get_distinct_output_slots() {
+        let session = session().await;
+        session
+            .insert_terminal("a".to_string(), terminal(Some(identity("pi", "s1"))))
+            .await;
+        session
+            .insert_terminal("b".to_string(), terminal(Some(identity("pi", "s1"))))
+            .await;
+        let terms = session.terminals.lock().await;
+        let slot_a = Arc::as_ptr(&terms["a"].output_sender) as usize;
+        let slot_b = Arc::as_ptr(&terms["b"].output_sender) as usize;
+        assert_ne!(slot_a, slot_b);
+    }
+
+    #[tokio::test]
+    async fn close_removes_only_selected_terminal() {
+        let session = session().await;
+        session
+            .insert_terminal("a".to_string(), terminal(Some(identity("pi", "s1"))))
+            .await;
+        session
+            .insert_terminal("b".to_string(), terminal(Some(identity("pi", "s1"))))
+            .await;
+        session.remove_terminal("a").await.unwrap().terminate();
+        let terms = session.terminals.lock().await;
+        assert_eq!(terms.len(), 1);
+        assert!(terms.contains_key("b"));
+    }
+
+    #[tokio::test]
+    async fn shared_termination_removes_matching_and_leaves_others() {
+        let session = session().await;
+        for (id, shared) in [
+            ("shared-1", Some(identity("pi", "s1"))),
+            ("shared-2", Some(identity("pi", "s1"))),
+            ("other-shared", Some(identity("pi", "s9"))),
+            ("plain", None),
+        ] {
+            session
+                .insert_terminal(id.to_string(), terminal(shared))
+                .await;
+        }
+
+        let removed = session.remove_shared_terminals("pi", "s1").await;
+        let ids: Vec<&str> = removed.iter().map(|(id, _)| id.as_str()).collect();
+        // Returned in terminal order, so this holds despite HashMap storage.
+        assert_eq!(ids, ["shared-1", "shared-2"]);
+        // The removed children terminate through the same close path.
+        for (_, terminal) in removed {
+            assert!(terminal.terminate());
+        }
+
+        let terms = session.terminals.lock().await;
+        assert_eq!(terms.len(), 2);
+        assert!(terms.contains_key("other-shared"));
+        assert!(terms.contains_key("plain"));
+        let order = session.terminal_order.lock().await;
+        assert_eq!(*order, ["other-shared".to_string(), "plain".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn resume_without_tmux_fails_before_any_terminal_insert() {
+        let session = session().await;
+        let error =
+            agent::resume_terminal_launch_with("pi", "abc123", Some(PathBuf::from("/tmp")), || {
+                tmux::TmuxClient::with_socket("/nonexistent/tmux-for-zedra-test", None)
+            })
+            .await
+            .err()
+            .expect("resume must fail when the tmux binary is missing");
+        assert!(error.to_string().contains("tmux"), "unexpected: {error:#}");
+        // No TermSession was inserted and no direct Pi resume compensated.
+        assert!(session.terminals.lock().await.is_empty());
+        assert!(session.terminal_order.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_with_old_tmux_fails_before_any_terminal_insert() {
+        let session = session().await;
+        let stub = stub_tmux("old", "#!/bin/sh\necho 'tmux 3.2'\n");
+        let probe = stub.clone();
+        let error = agent::resume_terminal_launch_with(
+            "pi",
+            "abc123",
+            Some(PathBuf::from("/tmp")),
+            move || tmux::TmuxClient::with_socket(&probe, None),
+        )
+        .await
+        .err()
+        .expect("resume must fail on a too-old tmux");
+        assert!(
+            error.to_string().contains("too old"),
+            "unexpected: {error:#}"
+        );
+        assert!(session.terminals.lock().await.is_empty());
+        assert!(session.terminal_order.lock().await.is_empty());
+        let _ = std::fs::remove_file(&stub);
+    }
+
+    #[tokio::test]
+    async fn resume_with_hung_tmux_times_out_before_any_terminal_insert() {
+        let session = session().await;
+        let stub = stub_tmux("hung", "#!/bin/sh\nsleep 30\n");
+        let probe = stub.clone();
+        let error = agent::resume_terminal_launch_with(
+            "pi",
+            "abc123",
+            Some(PathBuf::from("/tmp")),
+            move || tmux::TmuxClient::with_socket(&probe, None),
+        )
+        .await
+        .err()
+        .expect("resume must time out against a hung tmux");
+        // The timeout cause sits below the `tmux probe` context, so match on
+        // the rendered chain rather than the top-level message alone.
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("timed out"), "unexpected: {rendered}");
+        assert!(session.terminals.lock().await.is_empty());
+        assert!(session.terminal_order.lock().await.is_empty());
+        let _ = std::fs::remove_file(&stub);
+    }
+
+    #[tokio::test]
+    async fn nonshared_agent_resume_keeps_direct_launch_without_tmux() {
+        let launch = agent::resume_terminal_launch("claude", "abc123", None)
+            .await
+            .expect("non-shared resume must keep the direct launch");
+        assert!(launch.launch_cmd.contains("claude"));
+        assert!(launch.launch_cmd.contains("abc123"));
+        assert_eq!(launch.identity_cmd, None);
+        assert_eq!(launch.shared, None);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_blank_session_id_before_anything_spawns() {
+        let session = session().await;
+        let error = agent::resume_terminal_launch("pi", "   ", None)
+            .await
+            .err()
+            .expect("blank session id must fail");
+        assert!(
+            error.to_string().contains("missing session id"),
+            "unexpected: {error:#}"
+        );
+        assert!(session.terminals.lock().await.is_empty());
+    }
+}
