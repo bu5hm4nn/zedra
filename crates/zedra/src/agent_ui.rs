@@ -94,6 +94,36 @@ pub fn merge_shared_sessions(
         .collect()
 }
 
+/// Badge state for one shared tmux session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedSessionStatus {
+    Live,
+    Ended(Option<u32>),
+}
+
+impl SharedSessionStatus {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Live => "Live".to_string(),
+            Self::Ended(None) => "Ended".to_string(),
+            Self::Ended(Some(code)) => format!("Ended (code {code})"),
+        }
+    }
+
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+/// Pure live/dead → badge mapping for a session card.
+pub fn shared_session_status(shared: &AgentShareSession) -> SharedSessionStatus {
+    if shared.dead {
+        SharedSessionStatus::Ended(shared.exit_code)
+    } else {
+        SharedSessionStatus::Live
+    }
+}
+
 /// Wake handle nudging the poll to refresh right away; full/closed channels
 /// are no-ops.
 #[derive(Clone)]
@@ -520,6 +550,7 @@ fn format_reset_duration_dh(resets_at: i64) -> Option<String> {
 
 pub struct SessionCardProps<'a> {
     pub session: &'a AgentSessionSummary,
+    pub shared: Option<&'a AgentShareSession>,
     pub resume_on_tap: bool,
 }
 
@@ -579,11 +610,10 @@ pub fn render_session_card(props: SessionCardProps<'_>, cx: &App) -> Stateful<Di
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
-                .child(session_title_row(session, cx))
+                .child(session_title_row(session, props.shared, cx))
                 .child(session_meta_row(session, cx)),
         )
 }
-
 pub fn session_title(session: &AgentSessionSummary) -> String {
     session
         .title
@@ -592,7 +622,11 @@ pub fn session_title(session: &AgentSessionSummary) -> String {
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
-fn session_title_row(session: &AgentSessionSummary, cx: &App) -> Div {
+fn session_title_row(
+    session: &AgentSessionSummary,
+    shared: Option<&AgentShareSession>,
+    cx: &App,
+) -> Div {
     let mut row = div()
         .w_full()
         .min_w_0()
@@ -610,7 +644,10 @@ fn session_title_row(session: &AgentSessionSummary, cx: &App) -> Div {
                 .text_size(px(theme::FONT_BODY))
                 .text_color(rgb(theme::text_primary(cx)))
                 .child(session_title(session)),
-        );
+        )
+        .when_some(shared, |row, shared| {
+            row.child(shared_status_badge(shared, cx))
+        });
 
     if let Some(at) = session.last_activity_at.or(session.created_at) {
         row = row.child(
@@ -623,6 +660,29 @@ fn session_title_row(session: &AgentSessionSummary, cx: &App) -> Div {
     }
 
     row
+}
+
+/// Small semantic status chip: green while the shared pane runs, muted once
+/// it has ended.
+fn shared_status_badge(shared: &AgentShareSession, cx: &App) -> Div {
+    let status = shared_session_status(shared);
+    let text_color = if status.is_live() {
+        theme::accent_green(cx)
+    } else {
+        theme::text_muted(cx)
+    };
+    div()
+        .flex_shrink_0()
+        .px(px(theme::BADGE_PX))
+        .py(px(theme::BADGE_PY))
+        .rounded(px(theme::BADGE_RADIUS))
+        .bg(rgb(theme::bg_card(cx)))
+        .border_1()
+        .border_color(rgb(theme::border_subtle(cx)))
+        .text_size(px(theme::FONT_DETAIL))
+        .text_color(rgb(text_color))
+        .whitespace_nowrap()
+        .child(status.label())
 }
 
 fn session_meta_row(session: &AgentSessionSummary, cx: &App) -> impl IntoElement {
@@ -781,6 +841,7 @@ pub fn render_agent_session_list(props: AgentSessionListProps<'_>, cx: &App) -> 
             list = list.child(render_session_card(
                 SessionCardProps {
                     session: &item.session,
+                    shared: item.shared.as_ref(),
                     resume_on_tap: props.resume_on_tap,
                 },
                 cx,
@@ -842,6 +903,7 @@ pub fn render_virtualized_agent_session_list(
             AgentSessionRow::Session(item) => render_session_card(
                 SessionCardProps {
                     session: &item.session,
+                    shared: item.shared.as_ref(),
                     resume_on_tap,
                 },
                 cx,
@@ -900,8 +962,8 @@ fn day_label(at: Option<DateTime<Utc>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSessionItem, AgentSessionSummary, AgentShareSession, group_sessions_by_day,
-        merge_shared_sessions,
+        AgentSessionItem, AgentSessionSummary, AgentShareSession, SharedSessionStatus,
+        group_sessions_by_day, merge_shared_sessions, shared_session_status,
     };
     use chrono::Utc;
     use zedra_rpc::proto::AgentResumeSummary;
@@ -1005,5 +1067,31 @@ mod tests {
             items[0].shared.as_ref().unwrap().title.as_deref(),
             Some("live")
         );
+    }
+
+    #[test]
+    fn shared_status_is_live_for_running_panes() {
+        let status = shared_session_status(&share("s", false));
+        assert_eq!(status, SharedSessionStatus::Live);
+        assert!(status.is_live());
+        assert_eq!(status.label(), "Live");
+    }
+
+    #[test]
+    fn shared_status_reports_known_exit_codes_for_dead_panes() {
+        let status = shared_session_status(&share("s", true));
+        assert_eq!(status, SharedSessionStatus::Ended(Some(7)));
+        assert!(!status.is_live());
+        assert_eq!(status.label(), "Ended (code 7)");
+    }
+
+    #[test]
+    fn shared_status_stays_muted_when_exit_code_is_unknown() {
+        let mut dead = share("s", true);
+        dead.exit_code = None;
+
+        let status = shared_session_status(&dead);
+        assert_eq!(status, SharedSessionStatus::Ended(None));
+        assert_eq!(status.label(), "Ended");
     }
 }

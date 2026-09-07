@@ -2717,6 +2717,9 @@ impl Workspace {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::error!(agent = slug, "agent session resume failed: {}", e);
+                    // Host errors are actionable (missing/old tmux, prepare
+                    // failure); show the reason, not just the failure.
+                    let message = format!("Failed to resume the agent session.\n\n{e}");
                     let _ = workspace.update(cx, |ws, cx| {
                         ws.terminals.retain(|t| t.entity_id() != pending_entity_id);
                         ws.terminal_state.update(cx, |state, cx| {
@@ -2730,7 +2733,7 @@ impl Workspace {
                         }
                         platform_bridge::show_alert(
                             "Resume Agent",
-                            "Failed to resume the agent session.",
+                            &message,
                             vec![AlertButton::default("OK")],
                             |_| {},
                         );
