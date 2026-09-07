@@ -133,6 +133,14 @@ pub struct ResumeAgentSession {
     pub session_id: String,
 }
 
+/// Long-press terminate offer for a session card with a shared tmux snapshot.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = workspace, no_json)]
+pub struct TerminateSharedAgentSession {
+    pub slug: String,
+    pub session_id: String,
+}
+
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = workspace, no_json)]
 pub struct OpenTerminal {

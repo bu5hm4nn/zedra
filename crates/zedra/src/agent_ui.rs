@@ -548,6 +548,12 @@ fn format_reset_duration_dh(resets_at: i64) -> Option<String> {
 // Session card
 // ---------------------------------------------------------------------------
 
+/// Terminate is offered via long-press only for rows carrying a shared tmux
+/// snapshot — never for plain past rows or foreign tmux sessions.
+pub fn offers_terminate(shared: Option<&AgentShareSession>) -> bool {
+    shared.is_some()
+}
+
 pub struct SessionCardProps<'a> {
     pub session: &'a AgentSessionSummary,
     pub shared: Option<&'a AgentShareSession>,
@@ -586,6 +592,23 @@ pub fn render_session_card(props: SessionCardProps<'_>, cx: &App) -> Stateful<Di
                     platform_bridge::trigger_haptic(HapticFeedback::ImpactLight);
                     window.dispatch_action(
                         workspace_action::ResumeAgentSession {
+                            slug: slug.clone(),
+                            session_id: session_id.clone(),
+                        }
+                        .boxed_clone(),
+                        cx,
+                    );
+                }
+            })
+        })
+        .when(offers_terminate(props.shared), |el| {
+            el.on_long_press({
+                let session_id = session_id.clone();
+                let slug = slug.clone();
+                move |_event, window, cx| {
+                    platform_bridge::trigger_haptic(HapticFeedback::ImpactMedium);
+                    window.dispatch_action(
+                        workspace_action::TerminateSharedAgentSession {
                             slug: slug.clone(),
                             session_id: session_id.clone(),
                         }
@@ -963,7 +986,7 @@ fn day_label(at: Option<DateTime<Utc>>) -> String {
 mod tests {
     use super::{
         AgentSessionItem, AgentSessionSummary, AgentShareSession, SharedSessionStatus,
-        group_sessions_by_day, merge_shared_sessions, shared_session_status,
+        group_sessions_by_day, merge_shared_sessions, offers_terminate, shared_session_status,
     };
     use chrono::Utc;
     use zedra_rpc::proto::AgentResumeSummary;
@@ -1067,6 +1090,16 @@ mod tests {
             items[0].shared.as_ref().unwrap().title.as_deref(),
             Some("live")
         );
+    }
+
+    #[test]
+    fn terminate_is_offered_only_for_rows_with_a_shared_snapshot() {
+        assert!(offers_terminate(Some(&share("s", false))));
+        // Dead panes keep their snapshot, so the long-press still offers
+        // explicit cleanup.
+        assert!(offers_terminate(Some(&share("s", true))));
+        // Plain past rows and foreign tmux sessions never offer it.
+        assert!(!offers_terminate(None));
     }
 
     #[test]

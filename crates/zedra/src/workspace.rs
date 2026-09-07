@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::*;
 use uuid::Uuid;
 use zedra_rpc::ZedraPairingTicket;
-use zedra_rpc::proto::{HostEvent, SyncSessionResult};
+use zedra_rpc::proto::{AgentShareTerminateResult, HostEvent, SyncSessionResult};
 use zedra_session::{
     ConnectEvent, ConnectPhase, ConnectSnapshot, ReconnectReason, Session, SessionHandle,
     SessionState, signer::ClientSigner,
@@ -38,7 +38,8 @@ use crate::workspace_action::{
     GitCommit, GitShowItemActions, GitStage, GitUnstage, HideConnecting, NavigateBack,
     OpenAgentDetail, OpenAgentManage, OpenAgentSessions, OpenDrawer, OpenFile, OpenGitDiff,
     OpenTerminal, OpenWebClient, RestartConnection, ResumeAgentSession, RevealInFileExplorer,
-    ShowConnecting, SpawnAgentTerminal, SpawnAgentWebClient, ToggleDrawer,
+    ShowConnecting, SpawnAgentTerminal, SpawnAgentWebClient, TerminateSharedAgentSession,
+    ToggleDrawer,
 };
 use crate::workspace_connecting::WorkspaceConnecting;
 use crate::workspace_connection_banner::{BannerEvent, ConnectionBanner};
@@ -163,6 +164,10 @@ pub(crate) enum PendingWorkspaceAction {
     },
     SpawnAgentWebClient {
         slug: String,
+    },
+    TerminateSharedAgentSession {
+        slug: String,
+        session_id: String,
     },
 }
 
@@ -2676,6 +2681,77 @@ impl Workspace {
         self.resume_agent_session(action.slug.clone(), action.session_id.clone(), window, cx);
     }
 
+    fn handle_terminate_shared_agent_session(
+        &mut self,
+        action: &TerminateSharedAgentSession,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        info!(
+            agent = action.slug,
+            session_id = %action.session_id,
+            "handle TerminateSharedAgentSession from workspace"
+        );
+        let slug = action.slug.clone();
+        let session_id = action.session_id.clone();
+        let pending_platform_action = self.pending_platform_action.clone();
+        platform_bridge::show_alert(
+            "Terminate shared session?",
+            "This stops Pi and disconnects every attached terminal.",
+            vec![
+                AlertButton::destructive("Terminate"),
+                AlertButton::cancel("Cancel"),
+            ],
+            move |button_index| {
+                if button_index == 0 {
+                    pending_platform_action.set(
+                        PendingWorkspaceAction::TerminateSharedAgentSession {
+                            slug: slug.clone(),
+                            session_id: session_id.clone(),
+                        },
+                    );
+                }
+            },
+        );
+    }
+
+    /// Apply an explicit shared-session termination. The host already stopped
+    /// the agent and reaped the terminal children, so local cards go through
+    /// the normal close path and the row falls back to persisted history; any
+    /// failure keeps every card and surfaces the host's exact reason.
+    fn finish_terminate_shared_agent_session(
+        &mut self,
+        slug: String,
+        session_id: String,
+        outcome: AnyhowResult<AgentShareTerminateResult>,
+        cx: &mut Context<Self>,
+    ) {
+        let (terminal_ids, host_error) = match outcome {
+            Ok(result) => (result.terminal_ids, result.error),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let Some(error) = host_error else {
+            for id in terminal_ids {
+                self.close_terminal_by_id(id, cx);
+            }
+            self.workspace_state.update(cx, |state, cx| {
+                state.remove_shared_session(&slug, &session_id, cx);
+            });
+            return;
+        };
+        tracing::error!(
+            agent = slug,
+            session_id = session_id,
+            "shared agent session termination failed: {error}"
+        );
+        platform_bridge::show_alert(
+            "Terminate Session",
+            &format!("Failed to terminate the shared session.\n\n{error}"),
+            vec![AlertButton::default("OK")],
+            |_| {},
+        );
+    }
+
     fn resume_agent_session(
         &mut self,
         slug: String,
@@ -3144,6 +3220,19 @@ impl Workspace {
                 })
                 .detach();
             }
+            PendingWorkspaceAction::TerminateSharedAgentSession { slug, session_id } => {
+                let handle = self.session.handle().clone();
+                cx.spawn(async move |workspace, cx| {
+                    // Fails fast against a downgraded old host instead of hanging.
+                    let outcome = handle
+                        .agent_share_terminate(slug.clone(), session_id.clone())
+                        .await;
+                    let _ = workspace.update(cx, |ws, cx| {
+                        ws.finish_terminate_shared_agent_session(slug, session_id, outcome, cx);
+                    });
+                })
+                .detach();
+            }
         }
     }
 
@@ -3332,6 +3421,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::handle_open_agent_manage))
             .on_action(cx.listener(Self::handle_open_agent_detail))
             .on_action(cx.listener(Self::handle_resume_agent_session))
+            .on_action(cx.listener(Self::handle_terminate_shared_agent_session))
             .on_action(cx.listener(Self::handle_open_terminal))
             .on_action(cx.listener(Self::handle_close_terminal))
             .on_action(cx.listener(Self::handle_open_web_client))
