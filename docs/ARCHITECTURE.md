@@ -102,6 +102,38 @@ bound to the original session.
 
 Sessions persist independently of connections. PTYs keep running during disconnect. Terminals buffer output for replay on reconnect.
 
+### Shared agent sessions (tmux)
+
+For a resumed Pi session with a known session ID, tmux owns the Pi PTY instead
+of a bare `TermSession` child. The host prepares a durable tmux session named
+`zedra-pi-<hex(session_id)>` (`crates/zedra-host/src/tmux.rs`) that runs the
+actor's resume command, and every terminal — macOS SSH and each Zedra
+`TermSession` alike — attaches as an independent tmux client. tmux is
+authoritative for process liveness and shared terminal attachment; the existing
+Pi JSONL store stays authoritative for persisted session history.
+
+```
+                 tmux session zedra-pi-<hex>
+                 ┌─────────────────────────┐
+                 │ pane: pi <resume ...>   │
+                 └───────────┬─────────────┘
+        tmux clients attach  │  (independent)
+   ┌──────────────┬──────────┴──────────┐
+   │ macOS SSH    │ Zedra TermSession A │ Zedra TermSession B (card)
+   └──────────────┴─────────────────────┘
+```
+
+- One Zedra client stays active per `ServerSession` (`SessionOccupied`
+  otherwise), but each terminal card in that client is its own tmux client, so
+  several cards can attach to one shared session. Simultaneous multi-device
+  Zedra attachment is a future protocol/registry change, not a tmux one.
+- `zedra-host` restart preserves the tmux server and its sessions — the tmux
+  socket lives in `/tmp`. Recreating the container destroys it; container
+  recreation is the durable boundary. A later attach re-discovers the live
+  session through the ownership codec.
+- Closing a Zedra terminal card removes only that tmux client. Terminating
+  from the app kills the tmux session and the Pi pane and exits every client.
+
 ## Session Client (`zedra-session`)
 
 ### Connection Flow

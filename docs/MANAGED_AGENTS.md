@@ -80,6 +80,50 @@ Detect-only agents get their flags from the trailing `simple_actor!` argument;
 managed agents override `default_launch_command` (and put the flag in
 `resume_launch_command` too).
 
+### Shared sessions (tmux)
+
+Pi can resume a session inside a host-owned tmux session, so terminal clients
+besides Zedra attach to the same pane. Only Pi has this capability today:
+`AgentActor::supports_shared_sessions()` gates it, and the RPC and resume paths
+key on that flag — never on the `pi` slug.
+
+Zedra owns the tmux namespace `zedra-pi-<hex(session_id)>` in
+`crates/zedra-host/src/tmux.rs`. The codec hex-encodes the Pi session ID, is
+reversible and collision-free, and doubles as a safe tmux target: the host only
+lists and terminates names produced by this codec, so foreign or malformed
+tmux sessions stay untracked. Resuming a known session ID runs the actor's
+`resume_launch_command` as the tmux inner command — the actor stays the
+authority for what to launch; tmux owns only the PTY.
+
+Capability and errors:
+
+- The host discovers `tmux` on PATH and requires tmux 3.3a or newer. A missing
+  or too-old tmux fails every resume of a known Pi session with an actionable
+  error before a terminal is created. There is no direct-resume fallback.
+- A fresh Pi launch whose session ID is not known before spawn stays a direct
+  PTY child. Only known-ID resumes go through tmux.
+- `AgentShareList` reports `available: false` with the exact reason when tmux
+  is unusable; persisted session history keeps working. See
+  `docs/PROTOCOL_SPECS.md` §5.8.
+
+Close versus terminate:
+
+- Closing a terminal card detaches only that tmux client. The tmux session and
+  the Pi process keep running, and other clients keep their pane.
+- Terminate (long-press, destructive confirm) kills the tmux session: the Pi
+  process stops and every attached terminal exits. Plain terminals are never
+  affected.
+
+Limitations:
+
+- Zedra scrollback starts at attachment time. Older output is reachable
+  through tmux copy mode (prefix + `[`), not replayed into the Zedra card.
+- `window-size largest` sizes the pane from the largest attached interactive
+  client, maximizing width and height independently: a 120x40 desktop beside a
+  38x100 phone yields a 120x99 pane. The desktop scrolls rows it cannot show.
+- tmux sanitizes metadata output, so pane title and cwd are display-only and
+  lossy for non-ASCII bytes. Pi session IDs never pass through tmux output.
+
 ### CLI wrappers
 
 `zedra <slug> <args>` forwards to an agent's own CLI through `run_wrapped`. The

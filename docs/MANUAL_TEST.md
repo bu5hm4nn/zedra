@@ -2402,3 +2402,90 @@ fails and exits. `zedra codex resume` prompts instead. No model call is needed:
    non-resume arguments forward unchanged.
 7. From the app, tap a session open in a desktop terminal: the terminal shows
    the same prompt. Tap one open nowhere: codex resumes with no prompt.
+
+## 29. Shared Pi Sessions Over tmux
+
+Release gate for tmux-backed Pi session sharing. Prerequisites: the host runs
+this branch on macOS with `tmux` on PATH (`tmux -V`), and a saved Pi session
+exists in the workspace (`zedra agent sessions pi` or the app's Pi detail
+view). Use one iOS Simulator as the Zedra client.
+
+### Setup and live status
+
+1. Run `zedra start` on the host. In the app, connect to the workspace and
+   open the Pi agent detail view (or the global agent-sessions view).
+2. Expected: persisted Pi history renders as before, and a row whose session
+   is currently running under tmux shows a green `Live` badge; dead panes show
+   muted `Ended` or `Ended (code N)`.
+3. Leave the sessions view open for several seconds. Expected: the shared
+   snapshot refreshes roughly every 2 seconds without disturbing scroll
+   position, and rows without a live tmux session keep their past-only look.
+4. Run `tmux ls` on the host. Expected: only `zedra-pi-<hex>` names appear from
+   Zedra; foreign sessions the user created themselves are never listed in the
+   app.
+
+### Simultaneous SSH and Zedra clients
+
+1. Resume a saved Pi session from the app. Expected: a terminal card opens.
+2. On the host, run `tmux attach -t zedra-pi-<hex of that session id>` in a
+   macOS terminal. Expected: both the SSH terminal and the Zedra card show the
+   same pane; typing in one appears in the other.
+3. In the app, open a second card for the same session (tap the row again).
+   Expected: two cards attach to the same tmux session, both stay in sync, and
+   closing one card leaves Pi and the other card running.
+4. Type in both cards at once. Expected: both inputs reach Pi without dropping
+   either.
+5. Resize: put a desktop-sized Zedra card beside a phone-shaped one (e.g. one
+   at 120 columns, the other 38x100 portrait). Expected: the pane takes the
+   maximum width and the maximum height across clients independently — e.g.
+   120x99 for a 120x40 desktop plus a 38x100 phone, not 120x39. The desktop
+   client scrolls rows outside its height. Detaching the largest client drops
+   the pane to the next largest; re-attaching restores it.
+6. Run a command that changes the cwd and one that sets the window title
+   (OSC 0). Expected: the app's `AgentShareList` metadata picks up the new
+   title and cwd within the 2s poll (compare `tmux list-panes -t zedra-pi-<hex>
+   -F '#{pane_title}|#{pane_current_path}'`).
+7. Scroll back in a freshly opened card. Expected: only output since this
+   attachment is in the card's scrollback. To read older output, use tmux copy
+   mode on the host (`tmux attach` then the copy-mode key); it is not replayed
+   into the Zedra card.
+
+### Close, terminate, and restart
+
+1. Close each Zedra card in turn. Expected: Pi keeps running under tmux
+   (`tmux ls` still lists the session) and the SSH client never loses the
+   pane; the sessions row stays `Live`.
+2. From the sessions view, long-press a row with a shared snapshot. Expected:
+   a medium haptic and a destructive confirmation (`Terminate shared session?`
+   — `This stops Pi and disconnects every attached terminal.`). Cancel keeps
+   everything unchanged.
+3. Confirm `Terminate` with the SSH client still attached. Expected: the tmux
+   session and the Pi process are gone (`tmux ls` no longer lists it, the SSH
+   client exits), the app's matching cards close, the row falls back to past
+   history, and other terminals are untouched.
+4. Resume the session again, then kill the tmux server on the host (`tmux
+   kill-server` or killing the server process). Expected: within the poll
+   interval the row loses its `Live` badge and shows only the persisted
+   history state — the app falls back to past-only data rather than showing a
+   stale live entry.
+5. Restart `zedra start` while a shared session is live (tmux survives). Then
+   reconnect the app. Expected: the shared session re-attaches and the `Live`
+   badge returns; the tmux session was preserved across the host restart.
+6. With a shared Pi session live, pair a second Zedra device and have both
+   connect at the same time. Expected: the second device is blocked with
+   `Host occupied` exactly as in section 6 — shared sessions do not change the
+   one-active-client rule.
+7. Disconnect the first device entirely, then attach the second device and
+   resume the same session. Expected: sequential handoff works; the second
+   device attaches to the same live tmux session.
+
+### Without tmux
+
+1. Run the host with `tmux` made unavailable (e.g. a controlled `PATH` without
+   it, so the binary cannot be discovered).
+2. Open the sessions view and the Pi detail view. Expected: persisted history
+   stays fully usable; the app logs one contextual warning about the
+   unavailable shared-session feature and shows no persistent banner.
+3. Resume a known Pi session. Expected: an actionable resume error naming the
+   missing capability — no direct-resume fallback and no terminal card.
+   Fresh Pi launches (new session, no known ID) still work as plain PTY
