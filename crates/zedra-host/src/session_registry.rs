@@ -556,9 +556,20 @@ pub struct TermSession {
     pub created_at: SystemTime,
     /// Monotonic creation time for terminal uptime calculations.
     pub started_at: Instant,
+    /// Shared tmux-backed agent identity when this terminal attaches to a
+    /// shared agent session (resume-through-tmux path); `None` otherwise.
+    pub shared: Option<crate::pty::SharedSpawnIdentity>,
 }
 
 impl TermSession {
+    /// Whether this terminal belongs to the shared agent session
+    /// `(slug, session_id)`.
+    pub fn shared_matches(&self, slug: &str, session_id: &str) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|shared| shared.slug == slug && shared.session_id == session_id)
+    }
+
     pub fn terminate(mut self) -> bool {
         match self.child.try_wait() {
             Ok(Some(_)) => return true,
@@ -568,16 +579,36 @@ impl TermSession {
             }
         }
 
+        // portable-pty's `kill` only sends SIGHUP, which a shell can ignore
+        // while starting up, and a blocking wait on the dying child can wedge
+        // (observed on macOS). Poll with SIGKILL retries under a deadline so
+        // close and shared termination always return.
         if let Err(e) = self.child.kill() {
             tracing::warn!(err = %e, "failed to terminate terminal child");
-            return false;
         }
-
-        if let Err(e) = self.child.wait() {
-            tracing::warn!(err = %e, "failed to reap terminal child after close");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(e) => {
+                    // ECHILD means the child is already gone; treat as reaped.
+                    tracing::warn!(err = %e, "failed to reap terminal child after close");
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            if let Some(pid) = self.child.process_id() {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("terminal child did not die within 5s of SIGKILL");
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-
-        true
     }
 }
 
@@ -1600,6 +1631,34 @@ impl ServerSession {
         }
 
         terminal
+    }
+
+    /// Remove every terminal attached to the shared agent session
+    /// `(slug, session_id)` from `terminals` and `terminal_order`, returning
+    /// them in terminal order. Terminals for other sessions — shared or
+    /// plain — stay untouched.
+    pub async fn remove_shared_terminals(
+        &self,
+        slug: &str,
+        session_id: &str,
+    ) -> Vec<(String, TermSession)> {
+        let mut terms = self.terminals.lock().await;
+        let mut order = self.terminal_order.lock().await;
+        let ids: Vec<String> = order
+            .iter()
+            .filter(|id| {
+                terms
+                    .get(*id)
+                    .is_some_and(|t| t.shared_matches(slug, session_id))
+            })
+            .cloned()
+            .collect();
+        let removed: Vec<(String, TermSession)> = ids
+            .into_iter()
+            .filter_map(|id| terms.remove(&id).map(|terminal| (id, terminal)))
+            .collect();
+        order.retain(|id| terms.contains_key(id));
+        removed
     }
 
     pub async fn reorder_terminals(&self, ordered_ids: Vec<String>) -> Result<(), String> {

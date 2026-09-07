@@ -267,8 +267,9 @@ fn initial_host_meta(opts: &SpawnOptions) -> HostTermMeta {
         ..Default::default()
     };
     if let Some(command) = opts
-        .launch_cmd
+        .identity_launch_cmd
         .as_ref()
+        .or(opts.launch_cmd.as_ref())
         .filter(|command| !command.is_empty())
     {
         // Spawned terminals never emit 633;E for the launch command itself.
@@ -522,6 +523,7 @@ mod terminal_meta_preamble_tests {
             launch_cmd: Some("claude --resume session".to_owned()),
             color_scheme: None,
             env: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -2292,6 +2294,7 @@ pub async fn create_terminal(
 
     let color_scheme = opts.color_scheme.unwrap_or(TerminalColorScheme::Dark);
     let initial_meta = initial_host_meta(&opts);
+    let shared = opts.shared.clone();
     let shell = ShellSession::spawn(cols, rows, opts)?;
     let (pty_reader, pty_writer, master, child) = shell.take_reader();
 
@@ -2326,6 +2329,7 @@ pub async fn create_terminal(
                 backlog: backlog.clone(),
                 created_at: std::time::SystemTime::now(),
                 started_at: std::time::Instant::now(),
+                shared: shared.clone(),
             },
         )
         .await;
@@ -3336,6 +3340,7 @@ async fn dispatch(
                     launch_cmd,
                     color_scheme: None,
                     env: Vec::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -3379,6 +3384,7 @@ async fn dispatch(
                     launch_cmd,
                     color_scheme: msg.color_scheme,
                     env: Vec::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -3929,7 +3935,7 @@ async fn dispatch(
 
         ZedraMessage::AgentShareTerminate(msg) => {
             session.touch().await;
-            let result = agent_share_terminate_result(&msg.slug, &msg.session_id).await;
+            let result = agent_share_terminate_result(&session, &msg.slug, &msg.session_id).await;
             let _ = msg.tx.send(result).await;
         }
 
@@ -3959,66 +3965,57 @@ async fn dispatch(
                 .workdir
                 .clone()
                 .or_else(|| Some(state.workdir.clone()));
-            let launch_cmd = agent::resume_launch_command(&msg.slug, &msg.session_id);
-            let Some(launch_cmd) = launch_cmd else {
-                // `None` collapses three causes; report the specific one.
-                let error = if agent::actor(&msg.slug).is_none() {
-                    format!("unknown agent: {}", msg.slug)
-                } else if msg.session_id.trim().is_empty() {
-                    "missing session id".to_string()
-                } else {
-                    format!("agent {} does not support resume", msg.slug)
-                };
-                let _ = msg
-                    .tx
-                    .send(AgentResumeResult {
-                        terminal_id: String::new(),
-                        error: Some(error),
-                    })
-                    .await;
-                return Ok(());
-            };
-            match create_terminal(
-                &session,
-                msg.cols,
-                msg.rows,
-                SpawnOptions {
-                    workdir,
-                    launch_cmd: Some(launch_cmd),
-                    color_scheme: None,
-                    env: Vec::new(),
-                },
-            )
-            .await
-            {
-                Ok(terminal_id) => {
-                    zedra_telemetry::send(Event::HostTerminalOpen {
-                        has_launch_cmd: true,
-                    });
-                    let terminal_count = session.terminals.lock().await.len();
-                    if let Err(e) = metrics::record_terminal_created(&state.workdir, terminal_count)
+            let result =
+                match agent::resume_terminal_launch(&msg.slug, &msg.session_id, workdir.clone())
+                    .await
+                {
+                    Ok(launch) => match create_terminal(
+                        &session,
+                        msg.cols,
+                        msg.rows,
+                        SpawnOptions {
+                            workdir,
+                            launch_cmd: Some(launch.launch_cmd),
+                            color_scheme: None,
+                            env: Vec::new(),
+                            identity_launch_cmd: launch.identity_cmd,
+                            shared: launch.shared,
+                        },
+                    )
+                    .await
                     {
-                        tracing::warn!("Failed to record terminal metrics: {}", e);
-                    }
-                    let _ = msg
-                        .tx
-                        .send(AgentResumeResult {
-                            terminal_id,
-                            error: None,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!("AgentResume failed: {}", e);
-                    let _ = msg
-                        .tx
-                        .send(AgentResumeResult {
+                        Ok(terminal_id) => {
+                            zedra_telemetry::send(Event::HostTerminalOpen {
+                                has_launch_cmd: true,
+                            });
+                            let terminal_count = session.terminals.lock().await.len();
+                            if let Err(e) =
+                                metrics::record_terminal_created(&state.workdir, terminal_count)
+                            {
+                                tracing::warn!("Failed to record terminal metrics: {}", e);
+                            }
+                            AgentResumeResult {
+                                terminal_id,
+                                error: None,
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("AgentResume failed: {}", e);
+                            AgentResumeResult {
+                                terminal_id: String::new(),
+                                error: Some(e.to_string()),
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!("AgentResume failed: {}", error);
+                        AgentResumeResult {
                             terminal_id: String::new(),
-                            error: Some(e.to_string()),
-                        })
-                        .await;
-                }
-            }
+                            error: Some(error.to_string()),
+                        }
+                    }
+                };
+            let _ = msg.tx.send(result).await;
         }
 
         // -- LSP --
@@ -4148,10 +4145,15 @@ async fn agent_share_list_result(slug: &str) -> AgentShareListResult {
 /// tmux ownership codec, then kill the tmux session (the agent process stops
 /// and every attached terminal client exits with it).
 ///
-/// `terminal_ids` stays empty for now: `TermSession`s do not yet carry shared
-/// spawn metadata (added when resume routes through tmux), so there is
-/// nothing to match; the result field keeps that contract stable.
-async fn agent_share_terminate_result(slug: &str, session_id: &str) -> AgentShareTerminateResult {
+/// Only after the kill succeeds does host terminal state change: the removed
+/// terminals' client children are reaped through the normal close path and
+/// their ids returned so the client can drop its local cards. Terminals of
+/// other shared sessions — and plain terminals — stay untouched.
+async fn agent_share_terminate_result(
+    session: &ServerSession,
+    slug: &str,
+    session_id: &str,
+) -> AgentShareTerminateResult {
     let failure = |error: String| AgentShareTerminateResult {
         terminal_ids: Vec::new(),
         error: Some(error),
@@ -4164,18 +4166,29 @@ async fn agent_share_terminate_result(slug: &str, session_id: &str) -> AgentShar
     }
     let slug_owned = slug.to_string();
     let session_id_owned = session_id.to_string();
-    match tokio::task::spawn_blocking(move || {
+    let killed = tokio::task::spawn_blocking(move || {
         tmux::TmuxClient::discover()
             .and_then(|client| client.terminate_session(&slug_owned, &session_id_owned))
     })
-    .await
-    {
-        Ok(Ok(())) => AgentShareTerminateResult {
-            terminal_ids: Vec::new(),
-            error: None,
-        },
-        Ok(Err(error)) => failure(error.to_string()),
-        Err(join) => failure(join.to_string()),
+    .await;
+    match killed {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return failure(error.to_string()),
+        Err(join) => return failure(join.to_string()),
+    }
+    let removed = session.remove_shared_terminals(slug, session_id).await;
+    let terminal_ids: Vec<String> = removed.iter().map(|(id, _)| id.clone()).collect();
+    for (id, terminal) in removed {
+        tokio::task::spawn_blocking(move || terminal.terminate())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(id = %id, err = %e, "failed to terminate shared terminal child");
+                false
+            });
+    }
+    AgentShareTerminateResult {
+        terminal_ids,
+        error: None,
     }
 }
 

@@ -317,6 +317,7 @@ async fn create_terminal_handler(
         launch_cmd: launch_cmd.clone(),
         color_scheme: req.color_scheme,
         env: Vec::new(),
+        ..Default::default()
     };
 
     match create_terminal(&session, req.cols, req.rows, opts).await {
@@ -510,13 +511,24 @@ async fn resume_agent_handler(
         )
             .into_response();
     };
-    let Some(launch_cmd) = agent::resume_launch_command(actor.slug(), &req.session_id) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "missing session id"})),
-        )
-            .into_response();
-    };
+    let launch =
+        match agent::resume_terminal_launch(actor.slug(), &req.session_id, Some(workdir.clone()))
+            .await
+        {
+            Ok(launch) => launch,
+            Err(error) => {
+                tracing::warn!("REST agent resume failed: {}", error);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+    let identity_cmd = launch
+        .identity_cmd
+        .clone()
+        .unwrap_or_else(|| launch.launch_cmd.clone());
 
     match create_terminal(
         &session,
@@ -524,9 +536,11 @@ async fn resume_agent_handler(
         req.rows,
         SpawnOptions {
             workdir: Some(workdir),
-            launch_cmd: Some(launch_cmd.clone()),
+            launch_cmd: Some(launch.launch_cmd),
             color_scheme: None,
             env: Vec::new(),
+            identity_launch_cmd: launch.identity_cmd,
+            shared: launch.shared,
         },
     )
     .await
@@ -546,7 +560,7 @@ async fn resume_agent_handler(
             session
                 .push_event(HostEvent::TerminalCreated {
                     id: terminal_id.clone(),
-                    launch_cmd: Some(launch_cmd),
+                    launch_cmd: Some(identity_cmd),
                     agent_slug,
                 })
                 .await;

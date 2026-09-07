@@ -1,8 +1,9 @@
 use crate::session_registry::ServerSession;
+use crate::tmux;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
@@ -289,6 +290,81 @@ pub fn resume_launch_command(slug: &str, session_id: &str) -> Option<String> {
     crate::global_config::get()
         .agent_resume_cmd(slug, &quoted)
         .or_else(|| actor.resume_launch_command(&quoted))
+}
+
+/// Launch plan for resuming one agent session in a terminal.
+#[derive(Debug, Clone)]
+pub struct TerminalLaunch {
+    /// Command the PTY child runs.
+    pub launch_cmd: String,
+    /// Command terminal cards should show for identity when it differs from
+    /// `launch_cmd` (shared spawns run an outer tmux attach).
+    pub identity_cmd: Option<String>,
+    /// Shared agent identity when the terminal attaches to a shared
+    /// tmux-backed session.
+    pub shared: Option<crate::pty::SharedSpawnIdentity>,
+}
+
+/// Resolve how to resume `session_id` for `slug` in a terminal running in
+/// `workdir`.
+pub async fn resume_terminal_launch(
+    slug: &str,
+    session_id: &str,
+    workdir: Option<PathBuf>,
+) -> anyhow::Result<TerminalLaunch> {
+    resume_terminal_launch_with(slug, session_id, workdir, tmux::TmuxClient::discover).await
+}
+
+/// `resume_terminal_launch` with tmux discovery injected so tests can point at
+/// missing, too-old, or hung tmux binaries without touching a real server.
+pub(crate) async fn resume_terminal_launch_with<D>(
+    slug: &str,
+    session_id: &str,
+    workdir: Option<PathBuf>,
+    discover: D,
+) -> anyhow::Result<TerminalLaunch>
+where
+    D: FnOnce() -> anyhow::Result<tmux::TmuxClient> + Send + 'static,
+{
+    let Some(actor) = actor(slug) else {
+        anyhow::bail!("unknown agent: {slug}");
+    };
+    let Some(direct) = resume_launch_command(slug, session_id) else {
+        // `None` collapses three causes; report the specific one.
+        if session_id.trim().is_empty() {
+            anyhow::bail!("missing session id");
+        }
+        anyhow::bail!("agent {slug} does not support resume");
+    };
+    if !actor.supports_shared_sessions() {
+        return Ok(TerminalLaunch {
+            launch_cmd: direct,
+            identity_cmd: None,
+            shared: None,
+        });
+    }
+    let workdir = workdir.unwrap_or_else(|| PathBuf::from("."));
+    let slug_owned = slug.to_string();
+    let session_id_owned = session_id.to_string();
+    let identity = direct.clone();
+    let launch = tokio::task::spawn_blocking(move || -> anyhow::Result<TerminalLaunch> {
+        let client = discover()?;
+        let attach_command = client.prepare_session(&session_id_owned, &workdir, &direct)?;
+
+        Ok(TerminalLaunch {
+            launch_cmd: attach_command,
+            identity_cmd: Some(identity),
+            shared: Some(crate::pty::SharedSpawnIdentity {
+                // The ownership codec is reversible, so the original id
+                // round-trips through the tmux name losslessly.
+                slug: slug_owned,
+                session_id: session_id_owned,
+            }),
+        })
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(launch)
 }
 
 /// Shell-quoted `<zedra> <slug>` prefix that invokes an agent's wrapper.
