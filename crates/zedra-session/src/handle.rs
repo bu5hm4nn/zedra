@@ -38,6 +38,7 @@ struct SessionHandleInner {
     fs_upload_rpc_supported: AtomicBool,
     set_app_state_rpc_supported: AtomicBool,
     remote_open_rpc_supported: AtomicBool,
+    shared_agent_rpc_supported: AtomicBool,
     /// Runtime the terminal pump tasks spawn onto. Set by `Session::new` so
     /// `attach_remote` works even when a method is awaited from the GPUI thread.
     runtime: Mutex<Option<tokio::runtime::Handle>>,
@@ -79,6 +80,7 @@ impl SessionHandle {
             fs_upload_rpc_supported: AtomicBool::new(true),
             set_app_state_rpc_supported: AtomicBool::new(true),
             remote_open_rpc_supported: AtomicBool::new(true),
+            shared_agent_rpc_supported: AtomicBool::new(true),
             runtime: Mutex::new(None),
         }))
     }
@@ -587,6 +589,14 @@ impl SessionHandle {
         self.downgrade_rpc(&self.0.remote_open_rpc_supported, "remote open", err)
     }
 
+    fn downgrade_shared_agent_rpc(&self, err: &str) -> bool {
+        self.downgrade_rpc(
+            &self.0.shared_agent_rpc_supported,
+            "shared agent sessions",
+            err,
+        )
+    }
+
     // ─── RPC: remote project opening ────────────────────────────────────
 
     /// True until an older host rejects one of the remote-open RPCs.
@@ -633,6 +643,58 @@ impl SessionHandle {
             },
             Err(error) => {
                 self.downgrade_remote_open_rpc(&error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    // ─── RPC: shared agent sessions ──────────────────────────────────────
+
+    /// True until an older host rejects one of the shared-session RPCs. Only
+    /// the shared-session calls disable on downgrade; every other agent or
+    /// terminal feature keeps working against the same host.
+    pub fn shared_agent_sessions_supported(&self) -> bool {
+        self.0.shared_agent_rpc_supported.load(Ordering::Acquire)
+    }
+
+    /// List the agent's live tmux-backed shared sessions. `available: false`
+    /// with an `error` reason means the host lacks usable tmux or the agent
+    /// does not share sessions; persisted history is unaffected.
+    pub async fn agent_share_list(&self, slug: String) -> Result<AgentShareListResult> {
+        if !self.shared_agent_sessions_supported() {
+            return Err(anyhow::anyhow!(
+                "shared agent sessions are unsupported by host"
+            ));
+        }
+        match self.call(AgentShareListReq { slug }).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.downgrade_shared_agent_rpc(&error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// Terminate one shared session: the agent process stops and every
+    /// attached terminal client disconnects. Returns the caller's terminal
+    /// ids that were attached so the client can clean up its cards.
+    pub async fn agent_share_terminate(
+        &self,
+        slug: String,
+        session_id: String,
+    ) -> Result<AgentShareTerminateResult> {
+        if !self.shared_agent_sessions_supported() {
+            return Err(anyhow::anyhow!(
+                "shared agent sessions are unsupported by host"
+            ));
+        }
+        match self.call(AgentShareTerminateReq { slug, session_id }).await {
+            Ok(result) => match result.error {
+                Some(error) => Err(anyhow::anyhow!(error)),
+                None => Ok(result),
+            },
+            Err(error) => {
+                self.downgrade_shared_agent_rpc(&error.to_string());
                 Err(error)
             }
         }

@@ -24,6 +24,7 @@ use crate::session_registry::{
     ConsumeSlotResult, HostTermMeta, OutputSenderSlot, PairingSlotMode, ServerSession,
     SessionRegistry, TermBacklog, TermSession, MAX_WATCHED_PATHS_PER_SESSION,
 };
+use crate::tmux;
 use crate::uploads;
 use crate::utils;
 use anyhow::Result;
@@ -3920,6 +3921,18 @@ async fn dispatch(
             let _ = msg.tx.send(result).await;
         }
 
+        ZedraMessage::AgentShareList(msg) => {
+            session.touch().await;
+            let result = agent_share_list_result(&msg.slug).await;
+            let _ = msg.tx.send(result).await;
+        }
+
+        ZedraMessage::AgentShareTerminate(msg) => {
+            session.touch().await;
+            let result = agent_share_terminate_result(&msg.slug, &msg.session_id).await;
+            let _ = msg.tx.send(result).await;
+        }
+
         ZedraMessage::AgentFiles(msg) => {
             session.touch().await;
             let slug = msg.slug.clone();
@@ -4056,6 +4069,115 @@ async fn dispatch(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// List live tmux-backed shared sessions for `slug`.
+///
+/// Capability-gated through the actor registry (no per-agent match arms).
+/// A host without usable tmux reports `available: false` with the exact
+/// actionable reason; persisted agent history is untouched by this call.
+async fn agent_share_list_result(slug: &str) -> AgentShareListResult {
+    let Some(actor) = agent::actor(slug) else {
+        return AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some(format!("unknown agent: {slug}")),
+        };
+    };
+    if !actor.supports_shared_sessions() {
+        return AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some(format!("agent {slug} does not support shared sessions")),
+        };
+    }
+    // tmux discovery and listing are subprocess calls; keep them off the
+    // async dispatch path.
+    match tokio::task::spawn_blocking(tmux::TmuxClient::discover).await {
+        Ok(Ok(client)) => {
+            let version = client.version().to_string();
+            match tokio::task::spawn_blocking(move || client.list_sessions()).await {
+                Ok(Ok(panes)) => AgentShareListResult {
+                    available: true,
+                    version,
+                    sessions: panes
+                        .into_iter()
+                        .map(|pane| AgentShareSession {
+                            session_id: pane.session_id,
+                            title: Some(pane.metadata.title).filter(|t| !t.is_empty()),
+                            cwd: Some(pane.metadata.current_path).filter(|c| !c.is_empty()),
+                            current_command: Some(pane.process.current_command)
+                                .filter(|c| !c.is_empty()),
+                            dead: pane.process.dead,
+                            exit_code: pane.process.exit_code,
+                        })
+                        .collect(),
+                    error: None,
+                },
+                Ok(Err(error)) => AgentShareListResult {
+                    available: false,
+                    version,
+                    sessions: Vec::new(),
+                    error: Some(error.to_string()),
+                },
+                Err(join) => AgentShareListResult {
+                    available: false,
+                    version: String::new(),
+                    sessions: Vec::new(),
+                    error: Some(join.to_string()),
+                },
+            }
+        }
+        Ok(Err(error)) => AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some(error.to_string()),
+        },
+        Err(join) => AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some(join.to_string()),
+        },
+    }
+}
+
+/// Terminate one shared session: validate through the actor registry and the
+/// tmux ownership codec, then kill the tmux session (the agent process stops
+/// and every attached terminal client exits with it).
+///
+/// `terminal_ids` stays empty for now: `TermSession`s do not yet carry shared
+/// spawn metadata (added when resume routes through tmux), so there is
+/// nothing to match; the result field keeps that contract stable.
+async fn agent_share_terminate_result(slug: &str, session_id: &str) -> AgentShareTerminateResult {
+    let failure = |error: String| AgentShareTerminateResult {
+        terminal_ids: Vec::new(),
+        error: Some(error),
+    };
+    let Some(actor) = agent::actor(slug) else {
+        return failure(format!("unknown agent: {slug}"));
+    };
+    if !actor.supports_shared_sessions() {
+        return failure(format!("agent {slug} does not support shared sessions"));
+    }
+    let slug_owned = slug.to_string();
+    let session_id_owned = session_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        tmux::TmuxClient::discover()
+            .and_then(|client| client.terminate_session(&slug_owned, &session_id_owned))
+    })
+    .await
+    {
+        Ok(Ok(())) => AgentShareTerminateResult {
+            terminal_ids: Vec::new(),
+            error: None,
+        },
+        Ok(Err(error)) => failure(error.to_string()),
+        Err(join) => failure(join.to_string()),
+    }
+}
 
 struct DiagnosticEntry {
     message: String,

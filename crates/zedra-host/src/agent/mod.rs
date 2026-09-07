@@ -589,6 +589,14 @@ pub(crate) trait AgentActor: Sync {
         None
     }
 
+    /// True when the actor's sessions can run inside a shared tmux session
+    /// that independent terminal clients attach to. Gates the
+    /// `AgentShareList`/`AgentShareTerminate` RPCs; keep the per-agent tmux
+    /// namespace in `tmux.rs` authoritative.
+    fn supports_shared_sessions(&self) -> bool {
+        false
+    }
+
     /// Run `zedra <slug> <args>`; `None` when the agent has no wrapper.
     fn run_wrapped(&self, _args: &[String]) -> Option<Result<(), String>> {
         None

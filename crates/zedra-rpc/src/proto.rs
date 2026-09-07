@@ -266,6 +266,17 @@ pub enum ZedraProto {
     /// Kept at enum tail because protocol variants are append-only.
     #[rpc(tx = oneshot::Sender<HostWorkspaceOpenResult>)]
     HostWorkspaceOpen(HostWorkspaceOpenReq),
+
+    /// List live tmux-backed shared sessions for an agent slug.
+    /// Kept at enum tail because protocol variants are append-only.
+    #[rpc(tx = oneshot::Sender<AgentShareListResult>)]
+    AgentShareList(AgentShareListReq),
+
+    /// Terminate one shared tmux session, ending the agent process and every
+    /// attached terminal client.
+    /// Kept at enum tail because protocol variants are append-only.
+    #[rpc(tx = oneshot::Sender<AgentShareTerminateResult>)]
+    AgentShareTerminate(AgentShareTerminateReq),
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,6 +1560,62 @@ pub enum AgentDataSource {
     HookState,
     StatusLine,
     ProviderCli,
+}
+
+// ---------------------------------------------------------------------------
+// Shared agent sessions: tmux-backed sessions an independent terminal client
+// can attach to while the agent process keeps running.
+// ---------------------------------------------------------------------------
+
+/// List the agent's live tmux-backed shared sessions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentShareListReq {
+    /// Stable actor slug; only actors with the shared-session capability
+    /// return a live listing (others report `available: false`).
+    pub slug: String,
+}
+
+/// One live tmux-backed shared session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentShareSession {
+    /// The agent's own session id — the same id `AgentResume` accepts.
+    pub session_id: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub current_command: Option<String>,
+    /// True when the tmux pane's process has exited (`remain-on-exit` keeps
+    /// the pane visible); live panes report `false`.
+    pub dead: bool,
+    pub exit_code: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentShareListResult {
+    /// False when the host has no usable tmux (missing binary, too old) or the
+    /// agent lacks the shared-session capability; `error` then carries the
+    /// reason. Persisted session history is served by `AgentSessions`
+    /// regardless.
+    pub available: bool,
+    /// Host's tmux version string when `available` is true, empty otherwise.
+    pub version: String,
+    pub sessions: Vec<AgentShareSession>,
+    pub error: Option<String>,
+}
+
+/// Terminate one shared session: kills the tmux session (ending the agent
+/// process) and disconnects every attached terminal client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentShareTerminateReq {
+    pub slug: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentShareTerminateResult {
+    /// Ids of the caller's terminals that were attached to this shared
+    /// session; the client removes them locally.
+    pub terminal_ids: Vec<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

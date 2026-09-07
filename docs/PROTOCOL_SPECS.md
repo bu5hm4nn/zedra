@@ -386,6 +386,8 @@ All Git result types carry `error: Option<String>`. Host sends error when git re
 
 - `AiPrompt(AiPromptReq) -> AiPromptResult`
 - `AgentList(AgentListReq) -> AgentListResult`
+- `AgentShareList(AgentShareListReq) -> AgentShareListResult`
+- `AgentShareTerminate(AgentShareTerminateReq) -> AgentShareTerminateResult`
 - `AgentSessions(AgentSessionsReq) -> AgentSessionsResult`
 - `AgentResume(AgentResumeReq) -> AgentResumeResult`
 - `AgentInstalledList(AgentInstalledListReq) -> AgentInstalledListResult`
@@ -425,6 +427,47 @@ their history per workspace; `hermes` is global.
 - Data sources are explicit through `AgentDataSource` so clients can distinguish CLI/setup checks, historical scans, terminal metadata, hook state, status lines, and provider CLI output.
 - Summaries must not expose prompt text, command arguments, tool input/output, transcript bodies, or last assistant messages. Allowed fields are safe labels, ids, timestamps, counts, paths already scoped to the workspace, and provider metadata such as model, source, permission mode, CLI version, git branch, and PR link metadata.
 - `AgentLifecycleStatus`, `AgentEventKind`, and `AgentActionKind` provide the cross-agent vocabulary for future hook-driven prompts and notifications.
+
+### Shared agent session conventions
+
+Some actors can run a session inside a host-owned tmux session so independent
+terminal clients (e.g. macOS SSH) attach to the same pane. The host's tmux
+namespace (`zedra-pi-<hex(session_id)>`, `crates/zedra-host/src/tmux.rs`) is
+authoritative for ownership; Pi is the only actor with the capability today
+(`AgentActor::supports_shared_sessions`, registry-gated — no per-slug RPC
+logic).
+
+- `AgentShareListReq.slug` selects the actor. Unknown slugs and actors without
+  the capability return `available: false` with an `error` reason; they do not
+  fail the RPC.
+- `AgentShareListResult.available` is false when the host has no usable tmux
+  (binary missing, below tmux 3.3a) or the agent cannot share sessions; `error`
+  then carries the exact actionable reason. `version` is the host tmux version
+  when tmux is usable, empty otherwise. Persisted session history
+  (`AgentSessions`) is unaffected by tmux availability — a host without tmux
+  still returns its normal history there.
+- Each `AgentShareSession` carries the agent's own `session_id` (the same id
+  `AgentResume` accepts) plus live tmux metadata: `title`, `cwd`,
+  `current_command` (all optional, absent when empty), and `dead`/`exit_code`
+  for the pane process. Dead panes stay listed when tmux keeps them
+  (`remain-on-exit`); a live pane reports `dead: false`, `exit_code: None`.
+- Only Zedra-owned tmux sessions are listed. Foreign or malformed tmux
+  sessions are silently omitted; there is no screen scraping.
+- `AgentShareTerminate{slug, session_id}` kills the tmux session: the agent
+  process stops and every attached terminal client exits. The host validates
+  the slug and rebuilds the tmux target from the ownership codec, so arbitrary
+  tmux targets are impossible by construction. `terminal_ids` lists the
+  caller's terminals that were attached to the shared session so the client
+  can remove its local cards; it stays empty until terminals carry shared
+  spawn metadata (resume-through-tmux follow-up).
+- Termination errors (unknown agent, missing/too-old tmux, invalid session
+  id, tmux failure) surface in `error` and change no host terminal state.
+- Compatibility: both variants are appended at the `ZedraProto` tail under the
+  established `HostDirList`/`HostWorkspaceOpen` append-only rule — no ALPN
+  bump. Older hosts reject the unknown discriminant; the client disables only
+  the shared-session calls for that connection
+  (`SessionHandle::shared_agent_sessions_supported`) and every other agent or
+  terminal feature continues unchanged.
 
 ### Async managed-agent fetching
 
@@ -663,6 +706,20 @@ Any protocol-layer change must include all applicable steps:
 ---
 
 ## 11) Protocol Changelog
+
+### 2026-09-06 (shared agent sessions)
+
+- Appended `AgentShareList` and `AgentShareTerminate` request variants at the
+  enum tail (§5.8). No ALPN bump: the request set stays append-only and both
+  response types are new, so no type a `v3` client decodes changed.
+- Older hosts reject the unknown discriminant; the client disables only the
+  shared-session RPCs on the first incompatible error
+  (`SessionHandle::shared_agent_sessions_supported`), mirroring the
+  `remote_open_supported` pattern.
+- Host dispatch gates both RPCs through the actor registry
+  (`AgentActor::supports_shared_sessions`, true only for `pi` today) and the
+  host-owned tmux namespace; a host without usable tmux reports
+  `available: false` with the actionable reason instead of failing.
 
 ### 2026-08-04 (remote project opening)
 

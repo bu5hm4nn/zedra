@@ -647,6 +647,10 @@ impl AgentActor for PiActor {
         Some(format!("pi --session {quoted}"))
     }
 
+    fn supports_shared_sessions(&self) -> bool {
+        true
+    }
+
     // No remote plan/usage endpoint: `subscription_plan`/`account_usage` keep
     // the trait's None defaults.
 
