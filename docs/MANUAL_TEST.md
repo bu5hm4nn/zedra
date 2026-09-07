@@ -2406,9 +2406,11 @@ fails and exits. `zedra codex resume` prompts instead. No model call is needed:
 ## 29. Shared Pi Sessions Over tmux
 
 Release gate for tmux-backed Pi session sharing. Prerequisites: the host runs
-this branch on macOS with `tmux` on PATH (`tmux -V`), and a saved Pi session
-exists in the workspace (`zedra agent sessions pi` or the app's Pi detail
-view). Use one iOS Simulator as the Zedra client.
+this branch with `tmux` on PATH (`tmux -V`), and a saved Pi session exists in
+the workspace (`zedra agent sessions pi` or the app's Pi detail view). Use one
+iOS Simulator as the Zedra client. An unset `tmux.socket` uses tmux's standard
+socket under `/tmp`; a gateway uses an absolute persistent socket in the global
+config so sessions survive container recreation.
 
 ### Setup and live status
 
@@ -2427,9 +2429,10 @@ view). Use one iOS Simulator as the Zedra client.
 ### Simultaneous SSH and Zedra clients
 
 1. Resume a saved Pi session from the app. Expected: a terminal card opens.
-2. On the host, run `tmux attach -t zedra-pi-<hex of that session id>` in a
-   macOS terminal. Expected: both the SSH terminal and the Zedra card show the
-   same pane; typing in one appears in the other.
+2. From the gateway client, run `ssh zedra-pi 'pi:<session-id>'`. Expected:
+   the restricted wrapper attaches to the same pane without creating a shell;
+   both the SSH terminal and the Zedra card show the same output, and typing in
+   one appears in the other.
 3. In the app, open a second card for the same session (tap the row again).
    Expected: two cards attach to the same tmux session, both stay in sync, and
    closing one card leaves Pi and the other card running.
@@ -2447,8 +2450,8 @@ view). Use one iOS Simulator as the Zedra client.
    -F '#{pane_title}|#{pane_current_path}'`).
 7. Scroll back in a freshly opened card. Expected: only output since this
    attachment is in the card's scrollback. To read older output, use tmux copy
-   mode on the host (`tmux attach` then the copy-mode key); it is not replayed
-   into the Zedra card.
+   mode in the attached `ssh zedra-pi 'pi:<session-id>'` client (prefix + `[`);
+   it is not replayed into the Zedra card.
 
 ### Close, terminate, and restart
 

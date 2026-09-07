@@ -216,31 +216,59 @@ pub struct OwnedPane {
 /// fast, so a hung binary must never stall a resume or listing.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A discovered tmux client on a private socket.
+/// How a tmux client selects its server.
+#[derive(Debug, Clone)]
+enum TmuxSocket {
+    Default,
+    Name(String),
+    Path(PathBuf),
+}
+
+/// A discovered tmux client.
 ///
 /// Production constructs this with [`TmuxClient::discover`]; tests inject a
 /// binary path and socket name so they never touch the developer's server.
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     binary: PathBuf,
-    socket: Option<String>,
+    socket: TmuxSocket,
     version: TmuxVersion,
 }
 
 impl TmuxClient {
     /// Discover `tmux` on `PATH` and verify it supports shared sessions.
     ///
-    /// Returns the exact error a caller can surface, covering a missing
-    /// binary, unparsable `tmux -V` output, and releases below the minimum.
+    /// Returns the exact error a caller can surface, covering an invalid
+    /// configured socket, missing binary, unparsable `tmux -V` output, and
+    /// releases below the minimum.
     pub fn discover() -> Result<Self> {
+        let socket = Self::configured_socket(crate::global_config::get().tmux.socket.as_deref())?;
         ensure!(
             crate::agent::utils::command_on_path("tmux"),
             "tmux is not installed or not on PATH; install tmux {} or newer for shared agent sessions",
             min_supported_version()
         );
-        let client = Self::with_socket("tmux", None)?;
+        let mut client = Self {
+            binary: PathBuf::from("tmux"),
+            socket,
+            version: min_supported_version(),
+        };
+        client.probe_version()?;
         tracing::info!(version = %client.version, "tmux: client ready");
         Ok(client)
+    }
+
+    fn configured_socket(socket: Option<&Path>) -> Result<TmuxSocket> {
+        match socket {
+            None => Ok(TmuxSocket::Default),
+            Some(path) if !path.as_os_str().is_empty() && path.is_absolute() => {
+                Ok(TmuxSocket::Path(path.to_path_buf()))
+            }
+            Some(path) => anyhow::bail!(
+                "tmux.socket must be a non-empty absolute path: {}",
+                path.display()
+            ),
+        }
     }
 
     /// Construct with an explicit binary path and optional private socket name.
@@ -248,7 +276,9 @@ impl TmuxClient {
     pub fn with_socket(binary: impl AsRef<Path>, socket: Option<&str>) -> Result<Self> {
         let mut client = Self {
             binary: binary.as_ref().to_path_buf(),
-            socket: socket.map(str::to_string),
+            socket: socket
+                .map(|socket| TmuxSocket::Name(socket.to_string()))
+                .unwrap_or(TmuxSocket::Default),
             version: min_supported_version(),
         };
         client.probe_version()?;
@@ -260,13 +290,20 @@ impl TmuxClient {
         &self.version
     }
 
-    /// Exact argv for a tmux subcommand: binary, private-socket selection,
-    /// then the subcommand and its arguments.
+    /// Exact argv for a tmux subcommand: binary, socket selection, then the
+    /// subcommand and its arguments.
     fn argv(&self, args: &[&str]) -> Vec<String> {
         let mut argv = vec![self.binary.to_string_lossy().into_owned()];
-        if let Some(socket) = &self.socket {
-            argv.push("-L".to_string());
-            argv.push(socket.clone());
+        match &self.socket {
+            TmuxSocket::Default => {}
+            TmuxSocket::Name(name) => {
+                argv.push("-L".to_string());
+                argv.push(name.clone());
+            }
+            TmuxSocket::Path(path) => {
+                argv.push("-S".to_string());
+                argv.push(path.to_string_lossy().into_owned());
+            }
         }
         argv.extend(args.iter().map(|arg| arg.to_string()));
         argv
@@ -465,16 +502,18 @@ impl TmuxClient {
         Ok(())
     }
 
-    /// The command a terminal runs to attach: exec tmux, optionally select the
-    /// private socket, attach the owned target, and exit with tmux's status so
-    /// a failed attach does not leave a login shell behind.
+    /// The command a terminal runs to attach: exec tmux, select the configured
+    /// server, attach the owned target, and exit with tmux's status so a failed
+    /// attach does not leave a login shell behind.
     pub fn attach_command(&self, name: &str) -> String {
         let binary = shell_quote(&self.binary.to_string_lossy());
-        let socket = self
-            .socket
-            .as_deref()
-            .map(|socket| format!("-L {} ", shell_quote(socket)))
-            .unwrap_or_default();
+        let socket = match &self.socket {
+            TmuxSocket::Default => String::new(),
+            TmuxSocket::Name(name) => format!("-L {} ", shell_quote(name)),
+            TmuxSocket::Path(path) => {
+                format!("-S {} ", shell_quote(&path.to_string_lossy()))
+            }
+        };
         format!(
             "exec {binary} {socket}attach-session -t {} || exit $?",
             shell_quote(name)
@@ -679,7 +718,7 @@ mod tests {
     fn argv_construction_carries_socket_and_subcommand() {
         let default = TmuxClient {
             binary: PathBuf::from("/usr/bin/tmux"),
-            socket: None,
+            socket: TmuxSocket::Default,
             version: min_supported_version(),
         };
         assert_eq!(
@@ -689,7 +728,7 @@ mod tests {
 
         let private = TmuxClient {
             binary: PathBuf::from("/usr/bin/tmux"),
-            socket: Some("proof".to_string()),
+            socket: TmuxSocket::Name("proof".to_string()),
             version: min_supported_version(),
         };
         assert_eq!(
@@ -704,12 +743,49 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn configured_path_argv_uses_server_socket() {
+        let client = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: TmuxSocket::Path(PathBuf::from("/run/zedra/tmux.sock")),
+            version: min_supported_version(),
+        };
+        assert_eq!(
+            client.argv(&["-V"]),
+            ["/usr/bin/tmux", "-S", "/run/zedra/tmux.sock", "-V"]
+        );
+        assert_eq!(
+            client.argv(&["kill-session", "-t", "zedra-pi-61"]),
+            [
+                "/usr/bin/tmux",
+                "-S",
+                "/run/zedra/tmux.sock",
+                "kill-session",
+                "-t",
+                "zedra-pi-61"
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_socket_rejects_empty_and_relative_paths() {
+        for path in [Path::new(""), Path::new("relative/tmux.sock")] {
+            let error = TmuxClient::configured_socket(Some(path)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "tmux.socket must be a non-empty absolute path: {}",
+                    path.display()
+                )
+            );
+        }
+    }
 
     #[test]
     fn prepare_session_argv_is_exact() {
         let client = TmuxClient {
             binary: PathBuf::from("/opt/tmux"),
-            socket: Some("private".to_string()),
+            socket: TmuxSocket::Name("private".to_string()),
             version: min_supported_version(),
         };
         // `prepare_session` delegates argv to `run`/`argv`; asserting the exact
@@ -746,7 +822,7 @@ mod tests {
     fn set_option_argv_matches_proven_forms() {
         let client = TmuxClient {
             binary: PathBuf::from("/usr/bin/tmux"),
-            socket: Some("proof".to_string()),
+            socket: TmuxSocket::Name("proof".to_string()),
             version: min_supported_version(),
         };
         assert_eq!(
@@ -781,7 +857,7 @@ mod tests {
     fn attach_command_quotes_binary_socket_and_target() {
         let default = TmuxClient {
             binary: PathBuf::from("/usr/bin/tmux"),
-            socket: None,
+            socket: TmuxSocket::Default,
             version: min_supported_version(),
         };
         assert_eq!(
@@ -791,7 +867,7 @@ mod tests {
 
         let spaced_binary = TmuxClient {
             binary: PathBuf::from("/opt/My Tmux/tmux"),
-            socket: Some("private socket".to_string()),
+            socket: TmuxSocket::Name("private socket".to_string()),
             version: min_supported_version(),
         };
         assert_eq!(
@@ -801,12 +877,21 @@ mod tests {
 
         let quoted = TmuxClient {
             binary: PathBuf::from("/usr/bin/tmux"),
-            socket: None,
+            socket: TmuxSocket::Default,
             version: min_supported_version(),
         };
         assert_eq!(
             quoted.attach_command("zedra-pi-6f'27"),
             "exec /usr/bin/tmux attach-session -t 'zedra-pi-6f'\\''27' || exit $?"
+        );
+        let path_socket = TmuxClient {
+            binary: PathBuf::from("/usr/bin/tmux"),
+            socket: TmuxSocket::Path(PathBuf::from("/tmp/Zedra's Socket/tmux.sock")),
+            version: min_supported_version(),
+        };
+        assert_eq!(
+            path_socket.attach_command("zedra-pi-61"),
+            "exec /usr/bin/tmux -S '/tmp/Zedra'\\''s Socket/tmux.sock' attach-session -t zedra-pi-61 || exit $?"
         );
     }
 
@@ -845,7 +930,7 @@ mod tests {
     fn prepare_session_rejects_empty_session_ids_before_spawn() {
         let client = TmuxClient {
             binary: PathBuf::from("/usr/bin/tmux"),
-            socket: None,
+            socket: TmuxSocket::Default,
             version: min_supported_version(),
         };
         let error = client
@@ -858,7 +943,7 @@ mod tests {
     fn terminate_session_refuses_foreign_slugs_and_empty_ids() {
         let client = TmuxClient {
             binary: PathBuf::from("/usr/bin/tmux"),
-            socket: None,
+            socket: TmuxSocket::Default,
             version: min_supported_version(),
         };
         let error = client.terminate_session("claude", UUID).unwrap_err();
@@ -876,7 +961,7 @@ mod tests {
         // not silently degrade to an empty owned list.
         let binaryless = TmuxClient {
             binary: PathBuf::from("/nonexistent/tmux-for-zedra-test"),
-            socket: Some("definitely-missing-socket".to_string()),
+            socket: TmuxSocket::Name("definitely-missing-socket".to_string()),
             version: min_supported_version(),
         };
         let error = binaryless.list_sessions().unwrap_err();

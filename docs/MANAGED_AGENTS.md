@@ -100,6 +100,11 @@ Capability and errors:
 - The host discovers `tmux` on PATH and requires tmux 3.3a or newer. A missing
   or too-old tmux fails every resume of a known Pi session with an actionable
   error before a terminal is created. There is no direct-resume fallback.
+- Without `tmux.socket`, tmux uses its standard socket, usually under `/tmp`.
+  Set an absolute persistent path in the global config when sessions must
+  survive a container restart. The key is global-only because it selects the
+  server on which Zedra lists and terminates owned sessions. Every SSH or
+  manual tmux client must select the same socket.
 - A fresh Pi launch whose session ID is not known before spawn stays a direct
   PTY child. Only known-ID resumes go through tmux.
 - `AgentShareList` reports `available: false` with the exact reason when tmux

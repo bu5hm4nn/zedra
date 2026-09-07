@@ -127,10 +127,11 @@ Pi JSONL store stays authoritative for persisted session history.
   otherwise), but each terminal card in that client is its own tmux client, so
   several cards can attach to one shared session. Simultaneous multi-device
   Zedra attachment is a future protocol/registry change, not a tmux one.
-- `zedra-host` restart preserves the tmux server and its sessions — the tmux
-  socket lives in `/tmp`. Recreating the container destroys it; container
-  recreation is the durable boundary. A later attach re-discovers the live
-  session through the ownership codec.
+- `zedra-host` restart preserves the tmux server and its sessions. By default,
+  tmux stores its socket under `/tmp`, so recreating a container destroys it.
+  A global `tmux.socket` can select a persistent socket on a mounted volume;
+  every SSH or manual client must use that same path. A later attach
+  re-discovers the live session through the ownership codec.
 - Closing a Zedra terminal card removes only that tmux client. Terminating
   from the app kills the tmux session and the Pi pane and exits every client.
 
