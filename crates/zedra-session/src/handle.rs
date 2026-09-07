@@ -1317,3 +1317,50 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+mod shared_agent_tests {
+    use super::*;
+
+    #[test]
+    fn shared_agent_downgrade_disables_only_new_calls() {
+        let handle = SessionHandle::new();
+        assert!(handle.shared_agent_sessions_supported());
+
+        // Simulate an old host rejecting the unknown variant.
+        assert!(handle.downgrade_shared_agent_rpc(
+            "postcard deserialize error: unknown variant `AgentShareList`"
+        ));
+        assert!(!handle.shared_agent_sessions_supported());
+        // Unrelated capabilities stay enabled for the same connection.
+        assert!(handle.remote_open_supported());
+        assert!(handle.0.fs_search_rpc_supported.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn agent_share_calls_error_after_downgrade() {
+        let handle = SessionHandle::new();
+        handle
+            .0
+            .shared_agent_rpc_supported
+            .store(false, Ordering::Release);
+        let list_err = handle
+            .agent_share_list("pi".into())
+            .await
+            .expect_err("disabled call must fail fast");
+        assert!(list_err.to_string().contains("unsupported by host"));
+        let term_err = handle
+            .agent_share_terminate("pi".into(), "019e".into())
+            .await
+            .expect_err("disabled call must fail fast");
+        assert!(term_err.to_string().contains("unsupported by host"));
+    }
+
+    #[test]
+    fn shared_agent_downgrade_ignores_transport_errors() {
+        let handle = SessionHandle::new();
+        // Not-connected / transport errors must not permanently disable the
+        // feature for the connection.
+        assert!(!handle.downgrade_shared_agent_rpc("not connected"));
+        assert!(handle.shared_agent_sessions_supported());
+    }
+}

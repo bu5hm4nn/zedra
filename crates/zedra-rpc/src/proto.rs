@@ -2026,4 +2026,71 @@ mod tests {
         let decoded: AgentSessionSummary = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, session);
     }
+
+    #[test]
+    fn agent_share_roundtrip() {
+        let list_req = AgentShareListReq { slug: "pi".into() };
+        let encoded = postcard::to_allocvec(&list_req).unwrap();
+        let decoded: AgentShareListReq = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, list_req);
+
+        let result = AgentShareListResult {
+            available: true,
+            version: "3.3a".into(),
+            sessions: vec![AgentShareSession {
+                session_id: "019e".into(),
+                title: Some("Refactor rpc".into()),
+                cwd: Some("/repo".into()),
+                current_command: Some("pi".into()),
+                dead: false,
+                exit_code: None,
+            }],
+            error: None,
+        };
+        let encoded = postcard::to_allocvec(&result).unwrap();
+        let decoded: AgentShareListResult = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, result);
+
+        let unavailable = AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some("tmux is not installed".into()),
+        };
+        let encoded = postcard::to_allocvec(&unavailable).unwrap();
+        let decoded: AgentShareListResult = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, unavailable);
+
+        let term_req = AgentShareTerminateReq {
+            slug: "pi".into(),
+            session_id: "019e".into(),
+        };
+        let encoded = postcard::to_allocvec(&term_req).unwrap();
+        let decoded: AgentShareTerminateReq = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, term_req);
+
+        let term_result = AgentShareTerminateResult {
+            terminal_ids: vec!["term-1".into(), "term-2".into()],
+            error: None,
+        };
+        let encoded = postcard::to_allocvec(&term_result).unwrap();
+        let decoded: AgentShareTerminateResult = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, term_result);
+    }
+
+    #[test]
+    fn agent_share_enum_variants_roundtrip() {
+        let list = ZedraProto::AgentShareList(AgentShareListReq { slug: "pi".into() });
+        let encoded = postcard::to_allocvec(&list).unwrap();
+        let decoded: ZedraProto = postcard::from_bytes(&encoded).unwrap();
+        assert!(matches!(decoded, ZedraProto::AgentShareList(_)));
+
+        let term = ZedraProto::AgentShareTerminate(AgentShareTerminateReq {
+            slug: "pi".into(),
+            session_id: "019e".into(),
+        });
+        let encoded = postcard::to_allocvec(&term).unwrap();
+        let decoded: ZedraProto = postcard::from_bytes(&encoded).unwrap();
+        assert!(matches!(decoded, ZedraProto::AgentShareTerminate(_)));
+    }
 }
