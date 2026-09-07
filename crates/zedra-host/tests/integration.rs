@@ -988,3 +988,363 @@ async fn opencode_web_client_shares_one_server_per_card() {
 
     std::fs::remove_dir_all(&workdir).ok();
 }
+// ---------------------------------------------------------------------------
+// Real tmux: shared Pi session lifecycle. Ignored by default — needs tmux
+// >= 3.3a on PATH and runs throwaway sessions on a private `-L` socket, so
+// the developer's own tmux server is never touched.
+// Run with: cargo test -p zedra-host --test integration tmux_shared_session_lifecycle -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod tmux_lifecycle {
+    use super::*;
+    use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+    use zedra_host::tmux::{self, TmuxClient};
+
+    /// Best-effort cleanup for the private socket: kill only this test's
+    /// server. Never a pattern kill — that would hit unrelated tmux state.
+    struct PrivateSocket {
+        name: String,
+    }
+
+    impl Drop for PrivateSocket {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.name, "kill-server"])
+                .output();
+        }
+    }
+
+    /// A tmux client attached through the production attach command. The child
+    /// is `sh -c <command>` and the command `exec`s tmux, so the child process
+    /// is the tmux client itself and its exit status is tmux's own.
+    struct AttachedClient {
+        _master: Box<dyn MasterPty + Send>,
+        child: Box<dyn Child + Send + Sync>,
+        writer: Box<dyn Write + Send>,
+        output: mpsc::Receiver<String>,
+        seen: String,
+    }
+
+    impl AttachedClient {
+        fn spawn(attach_command: &str, cols: u16, rows: u16) -> Self {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("open pty for tmux client");
+            // tmux clients need a usable TERM or they refuse to attach.
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.arg("-c");
+            command.arg(attach_command);
+            command.env("TERM", "xterm-256color");
+            let child = pair
+                .slave
+                .spawn_command(command)
+                .expect("spawn tmux client");
+            drop(pair.slave);
+            let writer = pair.master.take_writer().expect("take client writer");
+            let reader = pair.master.try_clone_reader().expect("take client reader");
+            let (sender, output) = mpsc::channel();
+            thread::spawn(move || {
+                let mut reader = reader;
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            // The receiver lives as long as the client; a
+                            // failed send only means the test already moved on.
+                            let _ = sender.send(String::from_utf8_lossy(&buffer[..n]).into_owned());
+                        }
+                    }
+                }
+            });
+            Self {
+                _master: pair.master,
+                child,
+                writer,
+                output,
+                seen: String::new(),
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.process_id().expect("tmux client has a pid")
+        }
+
+        fn send(&mut self, line: &str) {
+            self.writer
+                .write_all(line.as_bytes())
+                .and_then(|()| self.writer.flush())
+                .expect("write to tmux client");
+        }
+
+        /// Drain the reader thread and report whether `pattern` has arrived.
+        fn received(&mut self, pattern: &str) -> bool {
+            while let Ok(chunk) = self.output.try_recv() {
+                self.seen.push_str(&chunk);
+            }
+            self.seen.contains(pattern)
+        }
+
+        fn exited(&mut self) -> bool {
+            self.child.try_wait().expect("poll tmux client").is_some()
+        }
+    }
+
+    impl Drop for AttachedClient {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+        }
+    }
+
+    fn tmux_output(socket: &str, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("tmux")
+            .args(["-L", socket])
+            .args(args)
+            .output()
+            .expect("spawn tmux")
+    }
+
+    fn tmux_text(socket: &str, args: &[&str]) -> String {
+        let output = tmux_output(socket, args);
+        assert!(
+            output.status.success(),
+            "tmux {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Poll `condition` for up to five seconds; the final check is authoritative.
+    fn wait_for(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return condition();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// (pane pid, pane dead) of the session's single pane.
+    fn pane_state(socket: &str, name: &str) -> Option<(u32, bool)> {
+        let line = tmux_text(
+            socket,
+            &["list-panes", "-t", name, "-F", "#{pane_pid}|#{pane_dead}"],
+        );
+        let (pid, dead) = line.lines().next()?.split_once('|')?;
+        Some((pid.parse().ok()?, dead == "1"))
+    }
+
+    fn client_count(socket: &str, name: &str) -> usize {
+        tmux_text(
+            socket,
+            &["list-clients", "-t", name, "-F", "#{client_name}"],
+        )
+        .lines()
+        .count()
+    }
+
+    /// Live pane size as `WxH`, from the session's display message.
+    fn pane_size(socket: &str, name: &str) -> String {
+        let format = "#{pane_width}x#{pane_height}";
+        tmux_text(socket, &["display-message", "-p", "-t", name, "-F", format])
+            .trim()
+            .to_string()
+    }
+
+    /// The client name owning `pid`, from the client list itself. Names are
+    /// release-dependent; the pid column is not.
+    fn client_name_by_pid(socket: &str, name: &str, pid: u32) -> Option<String> {
+        let format = "#{client_pid}|#{client_name}";
+        tmux_text(socket, &["list-clients", "-t", name, "-F", format])
+            .lines()
+            .find_map(|line| {
+                let (client_pid, client_name) = line.split_once('|')?;
+                (client_pid == pid.to_string()).then(|| client_name.to_string())
+            })
+    }
+
+    #[test]
+    #[ignore = "needs tmux >= 3.3a on PATH; creates throwaway sessions on a private socket"]
+    fn tmux_shared_session_lifecycle() {
+        let Ok(probe) = std::process::Command::new("tmux").arg("-V").output() else {
+            eprintln!("skipping tmux_shared_session_lifecycle: no tmux binary on PATH");
+            return;
+        };
+        let version = match tmux::supported_version(&String::from_utf8_lossy(&probe.stdout)) {
+            Ok(version) => version,
+            Err(reason) => {
+                eprintln!("skipping tmux_shared_session_lifecycle: {reason}");
+                return;
+            }
+        };
+        eprintln!("tmux_shared_session_lifecycle against tmux {version}");
+
+        let socket = PrivateSocket {
+            name: format!("zedra-it-{}", std::process::id()),
+        };
+        let client = TmuxClient::with_socket("tmux", Some(&socket.name)).expect("tmux client");
+        let workdir = tempfile::tempdir().expect("temp workdir");
+        std::fs::create_dir(workdir.path().join("elsewhere")).expect("create move target");
+        let elsewhere =
+            std::fs::canonicalize(workdir.path().join("elsewhere")).expect("canonical target");
+        let session_id = format!("lifecycle-{}", std::process::id());
+        let name = tmux::owned_session_name(&session_id).expect("owned name");
+
+        // Concurrent create-or-attach races start exactly one inner process.
+        let attach_commands: Vec<String> = thread::scope(|scope| {
+            let session_id = &session_id;
+            let workdir = workdir.path();
+            let racers: Vec<_> = (0..8)
+                .map(|_| {
+                    let client = client.clone();
+                    scope.spawn(move || {
+                        client
+                            .prepare_session(session_id, workdir, "sh")
+                            .expect("concurrent prepare must succeed")
+                    })
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|racer| racer.join().expect("prepare thread"))
+                .collect()
+        });
+        assert!(
+            attach_commands
+                .iter()
+                .all(|command| command == &attach_commands[0]),
+            "racers disagree on the attach command: {attach_commands:?}"
+        );
+        let (pane_pid, dead) = pane_state(&socket.name, &name).expect("one pane after the race");
+        assert!(
+            !dead && process_exists(pane_pid),
+            "inner process must be alive"
+        );
+
+        // The production listing sees exactly the prepared session.
+        let panes = client.list_sessions().expect("list sessions");
+        let listed = || client.list_sessions().unwrap_or_default();
+        assert_eq!(panes.len(), 1, "only the owned session is listed");
+        assert_eq!(panes[0].session_id, session_id);
+        assert!(!panes[0].process.dead);
+        assert!(!panes[0].process.current_command.is_empty());
+        assert_eq!(panes[0].metadata.start_command, "sh");
+
+        // Two independent pty clients attach through the production command.
+        let mut desktop = AttachedClient::spawn(&attach_commands[0], 100, 30);
+        let mut phone = AttachedClient::spawn(&attach_commands[0], 40, 12);
+        assert!(
+            wait_for(|| client_count(&socket.name, &name) == 2),
+            "both clients attached"
+        );
+        assert_eq!(
+            tmux_text(&socket.name, &["show-options", "-v", "-t", &name, "mouse"]).trim(),
+            "on",
+            "prepare_session must leave mouse on"
+        );
+        assert!(
+            wait_for(|| pane_size(&socket.name, &name) == "100x29"),
+            "pane sizes to the largest client"
+        );
+
+        // Input through both clients reaches the single inner process.
+        desktop.send("echo it-desktop\n");
+        phone.send("echo it-phone\n");
+        assert!(
+            wait_for(|| {
+                desktop.received("it-desktop")
+                    && desktop.received("it-phone")
+                    && phone.received("it-desktop")
+                    && phone.received("it-phone")
+            }),
+            "both clients see input from both sides"
+        );
+
+        // Metadata follows the inner process: title and cwd.
+        desktop.send("printf '\\033]0;it-title\\007'\n");
+        assert!(
+            wait_for(|| listed()
+                .first()
+                .is_some_and(|p| p.metadata.title == "it-title")),
+            "pane title follows the inner process"
+        );
+        phone.send("cd elsewhere\n");
+        let target = elsewhere.to_str().expect("utf-8 cwd").to_string();
+        assert!(
+            wait_for(|| listed()
+                .first()
+                .is_some_and(|p| p.metadata.current_path == target)),
+            "pane cwd follows the inner process"
+        );
+
+        // Detaching one client keeps Pi and the other client intact. The
+        // client name differs across tmux releases (tty path on 3.7,
+        // client-<pid> on 3.3a), so select by client_pid and use that
+        // record's own name as the target.
+        let phone_name =
+            client_name_by_pid(&socket.name, &name, phone.pid()).expect("phone client is listed");
+        let detach = tmux_output(&socket.name, &["detach-client", "-t", &phone_name]);
+        assert!(
+            detach.status.success(),
+            "detach failed: {}",
+            String::from_utf8_lossy(&detach.stderr)
+        );
+        assert!(wait_for(|| phone.exited()), "detached client exits");
+        assert!(
+            wait_for(|| client_count(&socket.name, &name) == 1),
+            "one client remains after the detach"
+        );
+        assert!(
+            process_exists(pane_pid),
+            "inner process survives the detach"
+        );
+        desktop.send("echo it-after-detach\n");
+        assert!(
+            wait_for(|| desktop.received("it-after-detach")),
+            "remaining client still drives Pi"
+        );
+
+        // Attaching again works while the session is live.
+        let mut second = AttachedClient::spawn(&attach_commands[0], 90, 26);
+        assert!(
+            wait_for(|| client_count(&socket.name, &name) == 2),
+            "reattach after the detach"
+        );
+        desktop.send("echo it-again\n");
+        assert!(
+            wait_for(|| second.received("it-again")),
+            "new client sees Pi output"
+        );
+
+        // Explicit termination ends Pi and every attached client.
+        client
+            .terminate_session("pi", &session_id)
+            .expect("terminate");
+        assert!(
+            wait_for(|| !process_exists(pane_pid)),
+            "inner process is gone"
+        );
+        assert!(
+            wait_for(|| desktop.exited() && second.exited()),
+            "all attached clients exit with the session"
+        );
+        assert!(
+            wait_for(|| client.list_sessions().unwrap_or_default().is_empty()),
+            "listing is empty after termination"
+        );
+    }
+}

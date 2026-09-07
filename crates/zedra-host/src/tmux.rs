@@ -342,9 +342,9 @@ impl TmuxClient {
             output.status,
             stderr.trim()
         );
-        // A fresh socket can transiently fail to connect while the server
-        // (started by this very call) is still binding; one retry resolves it.
-        if !output.status.success() {
+        // One retry resolves a fresh-socket connect race; an already-prepared
+        // target answers identically on every call and must not be retried.
+        if !output.status.success() && !already_prepared {
             let retry = self.run(&args, "prepare the shared session (retry)")?;
             ensure!(
                 retry.status.success(),
@@ -897,5 +897,31 @@ mod tests {
         ] {
             assert!(TmuxClient::is_no_server(stderr), "stderr: {stderr:?}");
         }
+    }
+
+    /// Executable stub `tmux` binary for subprocess tests; never a real server.
+    fn stub_tmux(name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("zedra-{name}-{}", std::process::id()));
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn prepare_session_accepts_already_prepared_session() {
+        // The proven already-prepared answer (rc 1 + "not a terminal") must
+        // succeed; the retry sees the same answer and would fail the prepare.
+        let stub = stub_tmux(
+            "already-prepared",
+            "#!/bin/sh\ncase \"$3\" in\n-V) echo 'tmux 3.5' ;;\nnew-session) echo 'open terminal failed: not a terminal' >&2; exit 1 ;;\nesac\nexit 0\n",
+        );
+        let binary = stub.clone();
+        let client = TmuxClient::with_socket(&binary, Some("stub")).expect("stub probes -V");
+        let attach = client
+            .prepare_session(UUID, Path::new("/tmp/workdir"), "pi resume")
+            .expect("already-prepared prepare must succeed");
+        assert!(attach.contains("attach-session -t zedra-pi-"));
+        let _ = std::fs::remove_file(&stub);
     }
 }
