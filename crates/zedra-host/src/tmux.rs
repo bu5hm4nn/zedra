@@ -455,9 +455,8 @@ impl TmuxClient {
         )?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Concurrent termination or a dead server already did the work.
             ensure!(
-                stderr.contains("can't find session:"),
+                stderr.contains("can't find session:") || Self::is_no_server(&stderr),
                 "tmux terminate the shared session failed with {}: {}",
                 output.status,
                 stderr.trim()
@@ -922,6 +921,23 @@ mod tests {
             .prepare_session(UUID, Path::new("/tmp/workdir"), "pi resume")
             .expect("already-prepared prepare must succeed");
         assert!(attach.contains("attach-session -t zedra-pi-"));
+        let _ = std::fs::remove_file(&stub);
+    }
+
+    #[test]
+    fn terminate_session_accepts_no_server_as_terminated() {
+        // With `exit-empty on`, kill-session of the last owned session exits
+        // the server; a second terminate then sees "no server running" and
+        // must count as already terminated, like "can't find session:".
+        let stub = stub_tmux(
+            "no-server-terminate",
+            "#!/bin/sh\ncase \"$3\" in\n-V) echo 'tmux 3.5' ;;\nkill-session) echo 'no server running on /tmp/tmux-0/stub' >&2; exit 1 ;;\nesac\nexit 0\n",
+        );
+        let binary = stub.clone();
+        let client = TmuxClient::with_socket(&binary, Some("stub")).expect("stub probes -V");
+        client
+            .terminate_session("pi", UUID)
+            .expect("no-server terminate must count as already terminated");
         let _ = std::fs::remove_file(&stub);
     }
 }
