@@ -300,9 +300,8 @@ pub struct TerminalLaunch {
     /// Command terminal cards should show for identity when it differs from
     /// `launch_cmd` (shared spawns run an outer tmux attach).
     pub identity_cmd: Option<String>,
-    /// Shared agent identity when the terminal attaches to a shared
-    /// tmux-backed session.
-    pub shared: Option<crate::pty::SharedSpawnIdentity>,
+    /// Managed backing when the terminal attaches through tmux.
+    pub backing: Option<crate::pty::TerminalBacking>,
 }
 
 /// Resolve how to resume `session_id` for `slug` in a terminal running in
@@ -340,26 +339,29 @@ where
         return Ok(TerminalLaunch {
             launch_cmd: direct,
             identity_cmd: None,
-            shared: None,
+            backing: None,
         });
     }
     let workdir = workdir.unwrap_or_else(|| PathBuf::from("."));
-    let slug_owned = slug.to_string();
+    let slug_owned = actor.slug().to_string();
     let session_id_owned = session_id.to_string();
     let identity = direct.clone();
     let launch = tokio::task::spawn_blocking(move || -> anyhow::Result<TerminalLaunch> {
         let client = discover()?;
-        let attach_command = client.prepare_session(&session_id_owned, &workdir, &direct)?;
+        let attach_command =
+            client.prepare_session(&slug_owned, &session_id_owned, &workdir, &direct)?;
 
         Ok(TerminalLaunch {
             launch_cmd: attach_command,
             identity_cmd: Some(identity),
-            shared: Some(crate::pty::SharedSpawnIdentity {
-                // The ownership codec is reversible, so the original id
-                // round-trips through the tmux name losslessly.
-                slug: slug_owned,
-                session_id: session_id_owned,
-            }),
+            backing: Some(crate::pty::TerminalBacking::SharedAgent(
+                crate::pty::SharedSpawnIdentity {
+                    // The ownership codec is reversible, so the original id
+                    // round-trips through the tmux name losslessly.
+                    slug: slug_owned,
+                    session_id: session_id_owned,
+                },
+            )),
         })
     })
     .await
@@ -1032,6 +1034,24 @@ mod tests {
         }
         assert!(resumable > 0, "no actor supports resume");
         assert_eq!(resume_launch_command("nosuchagent", "ses-123"), None);
+    }
+
+    #[test]
+    fn pi_and_omp_opt_into_shared_resume_with_actor_owned_commands() {
+        for (slug, expected) in [
+            ("pi", "pi --session session-1"),
+            ("omp", "omp --resume session-1"),
+        ] {
+            let actor = actor(slug).expect("registered actor");
+            assert!(actor.supports_shared_sessions(), "{slug} shared capability");
+            assert_eq!(
+                actor.resume_launch_command("session-1").as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(!actor("claude")
+            .expect("registered Claude actor")
+            .supports_shared_sessions());
     }
 
     #[test]

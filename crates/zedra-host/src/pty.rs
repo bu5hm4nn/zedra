@@ -34,15 +34,11 @@ pub struct SpawnOptions {
     pub color_scheme: Option<TerminalColorScheme>,
     /// Extra environment variables set on the spawned shell after sanitization.
     pub env: Vec<(String, String)>,
-    /// Identity command for terminal cards on shared spawns: the PTY runs an
-    /// outer wrapper (tmux attach), while meta/events carry this inner agent
-    /// command so cards still identify the agent. `None` keeps `launch_cmd`
-    /// as the identity.
+    /// Identity command for terminal cards when the PTY runs an outer wrapper
+    /// such as tmux attach. `None` keeps `launch_cmd` as the identity.
     pub identity_launch_cmd: Option<String>,
-    /// Shared tmux-backed agent identity of this terminal: `(slug, session_id)`
-    /// when the PTY child attaches to a shared agent session. Set only by the
-    /// resume-through-tmux path; every other terminal has `None`.
-    pub shared: Option<SharedSpawnIdentity>,
+    /// Optional managed backing for terminals attached through tmux.
+    pub backing: Option<TerminalBacking>,
 }
 
 /// Which shared agent session a terminal belongs to.
@@ -50,6 +46,13 @@ pub struct SpawnOptions {
 pub struct SharedSpawnIdentity {
     pub slug: String,
     pub session_id: String,
+}
+
+/// Managed process backing for a terminal attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalBacking {
+    SharedAgent(SharedSpawnIdentity),
+    ExternalTmux { session_name: String },
 }
 
 fn launch_script(launch_cmd: &str) -> String {

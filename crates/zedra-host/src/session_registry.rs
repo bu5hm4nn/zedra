@@ -10,6 +10,7 @@
 use crate::docs_tree::{
     snapshot_page_result, DocsTreeCacheEntry, DocsTreeSnapshot, DOCS_TREE_CACHE_TTL,
 };
+use crate::pty::TerminalBacking;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -556,18 +557,27 @@ pub struct TermSession {
     pub created_at: SystemTime,
     /// Monotonic creation time for terminal uptime calculations.
     pub started_at: Instant,
-    /// Shared tmux-backed agent identity when this terminal attaches to a
-    /// shared agent session (resume-through-tmux path); `None` otherwise.
-    pub shared: Option<crate::pty::SharedSpawnIdentity>,
+    /// Managed backing when this terminal attaches through tmux.
+    pub backing: Option<TerminalBacking>,
 }
 
 impl TermSession {
     /// Whether this terminal belongs to the shared agent session
     /// `(slug, session_id)`.
     pub fn shared_matches(&self, slug: &str, session_id: &str) -> bool {
-        self.shared
-            .as_ref()
-            .is_some_and(|shared| shared.slug == slug && shared.session_id == session_id)
+        matches!(
+            self.backing.as_ref(),
+            Some(TerminalBacking::SharedAgent(shared))
+                if shared.slug == slug && shared.session_id == session_id
+        )
+    }
+
+    /// Whether this terminal attaches to the byte-exact external tmux session.
+    pub fn external_tmux_matches(&self, name: &str) -> bool {
+        matches!(
+            self.backing.as_ref(),
+            Some(TerminalBacking::ExternalTmux { session_name }) if session_name == name
+        )
     }
 
     pub fn terminate(mut self) -> bool {
@@ -1661,6 +1671,28 @@ impl ServerSession {
         removed
     }
 
+    /// Remove every terminal attached to the byte-exact external tmux session,
+    /// returning them in terminal order without touching plain or shared terminals.
+    pub async fn remove_external_tmux_terminals(&self, name: &str) -> Vec<(String, TermSession)> {
+        let mut terms = self.terminals.lock().await;
+        let mut order = self.terminal_order.lock().await;
+        let ids: Vec<String> = order
+            .iter()
+            .filter(|id| {
+                terms
+                    .get(*id)
+                    .is_some_and(|terminal| terminal.external_tmux_matches(name))
+            })
+            .cloned()
+            .collect();
+        let removed: Vec<(String, TermSession)> = ids
+            .into_iter()
+            .filter_map(|id| terms.remove(&id).map(|terminal| (id, terminal)))
+            .collect();
+        order.retain(|id| terms.contains_key(id));
+        removed
+    }
+
     pub async fn reorder_terminals(&self, ordered_ids: Vec<String>) -> Result<(), String> {
         let terms = self.terminals.lock().await;
         validate_terminal_order(&ordered_ids, terms.keys().map(String::as_str))?;
@@ -1929,6 +1961,108 @@ mod tests {
 
     fn make_pubkey(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    fn terminal(backing: Option<TerminalBacking>) -> TermSession {
+        let shell = crate::pty::ShellSession::spawn(
+            80,
+            24,
+            crate::pty::SpawnOptions {
+                launch_cmd: Some("exit 0".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_reader, writer, master, child) = shell.take_reader();
+        TermSession {
+            writer: Arc::new(std::sync::Mutex::new(writer)),
+            master,
+            child,
+            output_sender: Arc::new(std::sync::Mutex::new(OutputSenderSlot {
+                gen: 0,
+                sender: None,
+            })),
+            host_meta: Arc::new(std::sync::Mutex::new(HostTermMeta::default())),
+            backlog: Arc::new(std::sync::Mutex::new(TermBacklog::new())),
+            created_at: SystemTime::now(),
+            started_at: Instant::now(),
+            backing,
+        }
+    }
+
+    fn shared_backing(slug: &str, session_id: &str) -> TerminalBacking {
+        TerminalBacking::SharedAgent(crate::pty::SharedSpawnIdentity {
+            slug: slug.to_string(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn external_backing(session_name: &str) -> TerminalBacking {
+        TerminalBacking::ExternalTmux {
+            session_name: session_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn terminal_backing_matching_is_isolated_and_exact() {
+        let shared = terminal(Some(shared_backing("pi", "cars_us")));
+        assert!(shared.shared_matches("pi", "cars_us"));
+        assert!(!shared.shared_matches("pi", "cars"));
+        assert!(!shared.external_tmux_matches("cars_us"));
+        assert!(shared.terminate());
+
+        let external = terminal(Some(external_backing("cars_us")));
+        assert!(external.external_tmux_matches("cars_us"));
+        assert!(!external.external_tmux_matches("cars"));
+        assert!(!external.external_tmux_matches("cars_us "));
+        assert!(!external.shared_matches("pi", "cars_us"));
+        assert!(external.terminate());
+
+        let plain = terminal(None);
+        assert!(!plain.external_tmux_matches("cars_us"));
+        assert!(!plain.shared_matches("pi", "cars_us"));
+        assert!(plain.terminate());
+    }
+
+    #[tokio::test]
+    async fn external_tmux_cleanup_removes_only_exact_backing_in_terminal_order() {
+        let registry = SessionRegistry::new();
+        let session = create_session(&registry).await;
+        for (id, backing) in [
+            ("external-a", Some(external_backing("cars_us"))),
+            ("prefix", Some(external_backing("cars_us-old"))),
+            ("external-b", Some(external_backing("cars_us"))),
+            ("shared", Some(shared_backing("pi", "cars_us"))),
+            ("plain", None),
+        ] {
+            session
+                .insert_terminal(id.to_string(), terminal(backing))
+                .await;
+        }
+
+        let removed = session.remove_external_tmux_terminals("cars_us").await;
+        assert_eq!(
+            removed
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["external-a", "external-b"]
+        );
+        assert!(removed
+            .into_iter()
+            .all(|(_, terminal)| terminal.terminate()));
+
+        assert_eq!(
+            session.terminal_ids().await,
+            vec![
+                "prefix".to_string(),
+                "shared".to_string(),
+                "plain".to_string(),
+            ]
+        );
+        for id in ["prefix", "shared", "plain"] {
+            assert!(session.remove_terminal(id).await.unwrap().terminate());
+        }
     }
 
     fn active_connection(pubkey: [u8; 32]) -> ActiveClientConnection {

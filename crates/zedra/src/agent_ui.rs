@@ -4,17 +4,18 @@ use futures::{FutureExt, StreamExt, future, pin_mut};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 use zedra_rpc::proto::{
     AgentInfoField, AgentSessionSummary, AgentSetupState, AgentShareSession, AgentSummary,
-    AgentUsageSnapshot,
+    AgentUsageSnapshot, TmuxSessionSummary,
 };
 use zedra_session::SessionHandle;
 
 use crate::fonts;
 use crate::platform_bridge::{self, HapticFeedback};
-use crate::workspace_state::WorkspaceState;
+use crate::workspace_state::{AgentSharedSessions, WorkspaceState};
 use crate::{theme, workspace_action};
 
 // Enough offscreen rows to keep fast mobile scrolls smooth without measuring
@@ -53,12 +54,8 @@ pub fn setup_label(state: AgentSetupState) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Shared tmux sessions (Pi)
+// Shared tmux sessions
 // ---------------------------------------------------------------------------
-
-/// Only agents with the host-side shared-session capability are polled; Pi
-/// is the only one today.
-pub const SHARED_SESSION_AGENT_SLUG: &str = "pi";
 
 /// Interval between tmux snapshots while a sessions view is open.
 const SHARED_SESSION_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -70,25 +67,21 @@ pub struct AgentSessionItem {
     pub shared: Option<AgentShareSession>,
 }
 
-/// Pair persisted history with the live tmux snapshot by `(slug, session_id)`.
-/// Pure: rows keep their order and timestamps; shares without a persisted row
-/// are dropped (never fabricated), and duplicate entries collapse to the first.
+/// Pair persisted history with live tmux snapshots by `(slug, session_id)`.
+/// Rows keep their order and timestamps; unmatched shares are never fabricated.
 pub fn merge_shared_sessions(
     sessions: Vec<AgentSessionSummary>,
-    slug: &str,
-    shares: &[AgentShareSession],
+    snapshots: &[AgentSharedSessions],
 ) -> Vec<AgentSessionItem> {
     sessions
         .into_iter()
         .map(|session| {
-            let shared = if session.slug == slug {
-                shares
-                    .iter()
-                    .find(|share| share.session_id == session.session_id)
-                    .cloned()
-            } else {
-                None
-            };
+            let shared = snapshots
+                .iter()
+                .filter(|snapshot| snapshot.available && snapshot.slug == session.slug)
+                .flat_map(|snapshot| snapshot.sessions.iter())
+                .find(|share| share.session_id == session.session_id)
+                .cloned();
             AgentSessionItem { session, shared }
         })
         .collect()
@@ -124,27 +117,125 @@ pub fn shared_session_status(shared: &AgentShareSession) -> SharedSessionStatus 
     }
 }
 
-/// Wake handle nudging the poll to refresh right away; full/closed channels
-/// are no-ops.
+#[derive(Debug)]
+struct SharedSessionPollControl {
+    targets: Vec<String>,
+    target_revision: u64,
+    refresh_revision: u64,
+}
+
+impl SharedSessionPollControl {
+    fn new(targets: Vec<String>) -> Self {
+        Self {
+            targets: distinct_slugs(targets),
+            target_revision: 0,
+            refresh_revision: 0,
+        }
+    }
+
+    fn set_targets(&mut self, targets: Vec<String>) -> bool {
+        let targets = distinct_slugs(targets);
+        if self.targets == targets {
+            return false;
+        }
+        self.targets = targets;
+        self.target_revision = self.target_revision.wrapping_add(1);
+        true
+    }
+
+    fn request_refresh(&mut self) {
+        self.refresh_revision = self.refresh_revision.wrapping_add(1);
+    }
+}
+
+#[derive(Debug)]
+struct SharedSessionPollState {
+    targets: Vec<String>,
+    target_revision: u64,
+    refresh_revision: u64,
+    parked: HashSet<String>,
+}
+
+impl SharedSessionPollState {
+    fn new(control: &SharedSessionPollControl) -> Self {
+        Self {
+            targets: control.targets.clone(),
+            target_revision: control.target_revision,
+            refresh_revision: control.refresh_revision,
+            parked: HashSet::new(),
+        }
+    }
+
+    fn sync(&mut self, control: &SharedSessionPollControl) {
+        if self.target_revision != control.target_revision {
+            self.targets.clone_from(&control.targets);
+            self.target_revision = control.target_revision;
+            self.parked.clear();
+        }
+        if self.refresh_revision != control.refresh_revision {
+            self.refresh_revision = control.refresh_revision;
+            self.parked.clear();
+        }
+    }
+
+    fn pollable_targets(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .filter(|slug| !self.parked.contains(*slug))
+            .cloned()
+            .collect()
+    }
+
+    fn contains_target(&self, slug: &str) -> bool {
+        self.targets.iter().any(|target| target == slug)
+    }
+
+    fn park_all(&mut self) {
+        self.parked.extend(self.targets.iter().cloned());
+    }
+}
+
+fn distinct_slugs(slugs: Vec<String>) -> Vec<String> {
+    let mut distinct = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        if !distinct.iter().any(|existing| existing == &slug) {
+            distinct.push(slug);
+        }
+    }
+    distinct
+}
+
+/// Handle for changing poll targets or waking parked targets immediately.
 #[derive(Clone)]
 pub struct SharedSessionPollHandle {
+    control: Rc<RefCell<SharedSessionPollControl>>,
     wake: Rc<RefCell<futures::channel::mpsc::Sender<()>>>,
 }
 
 impl SharedSessionPollHandle {
+    pub fn set_targets(&self, targets: Vec<String>) {
+        let changed = self.control.borrow_mut().set_targets(targets);
+        if changed {
+            self.wake();
+        }
+    }
+
     pub fn request_refresh(&self) {
+        self.control.borrow_mut().request_refresh();
+        self.wake();
+    }
+
+    fn wake(&self) {
         let _ = self.wake.borrow_mut().try_send(());
     }
 }
 
-/// Poll `AgentShareList` for [`SHARED_SESSION_AGENT_SLUG`] while the owning
-/// view lives. Requests never overlap: the next fires only after the previous
-/// response is applied and the interval elapses — or a wake arrives early.
-/// Cancels when the view drops the `Task`; `on_snapshot` re-derives display
-/// rows after a changed snapshot.
+/// Poll each target sequentially while the owning view lives. Whole cycles are
+/// serialized, and `on_snapshot` runs once after a cycle changes display state.
 pub fn spawn_shared_session_poll<T, F>(
     session_handle: SessionHandle,
     workspace_state: Entity<WorkspaceState>,
+    initial_targets: Vec<String>,
     on_snapshot: F,
     cx: &mut Context<T>,
 ) -> (Task<()>, SharedSessionPollHandle)
@@ -152,15 +243,51 @@ where
     T: 'static,
     F: Fn(&mut T, &mut Context<T>) + 'static,
 {
+    let control = Rc::new(RefCell::new(SharedSessionPollControl::new(initial_targets)));
+    let task_control = Rc::clone(&control);
     let (wake, mut wake_rx) = futures::channel::mpsc::channel::<()>(1);
     let task = cx.spawn(async move |this, cx| {
+        let mut poll_state = SharedSessionPollState::new(&task_control.borrow());
         loop {
-            let listing = session_handle
-                .agent_share_list(SHARED_SESSION_AGENT_SLUG.to_string())
-                .await;
+            poll_state.sync(&task_control.borrow());
+            let targets = poll_state.pollable_targets();
+            if targets.is_empty() {
+                if wake_rx.next().await.is_none() {
+                    break;
+                }
+                continue;
+            }
+
+            let mut downgraded = !session_handle.shared_agent_sessions_supported();
+            let mut outcomes = Vec::with_capacity(targets.len());
+            if !downgraded {
+                for slug in targets {
+                    let outcome = session_handle.agent_share_list(slug.clone()).await;
+                    if !session_handle.shared_agent_sessions_supported() {
+                        downgraded = true;
+                        break;
+                    }
+                    outcomes.push((slug, outcome));
+                }
+            }
+
+            // A target update may arrive while an RPC is in flight. Apply only
+            // outcomes that still belong to this view's latest target set.
+            poll_state.sync(&task_control.borrow());
+            outcomes.retain(|(slug, _)| poll_state.contains_target(slug));
+            if downgraded {
+                poll_state.park_all();
+            }
+
             let applied = this.update(cx, |this, cx| {
                 let changed = workspace_state.update(cx, |state, cx| {
-                    state.apply_shared_sessions(SHARED_SESSION_AGENT_SLUG, listing.as_ref(), cx)
+                    if downgraded {
+                        state.clear_shared_session_snapshots(cx)
+                    } else {
+                        outcomes.iter().fold(false, |changed, (slug, outcome)| {
+                            state.apply_shared_sessions(slug, outcome.as_ref(), cx) || changed
+                        })
+                    }
                 });
                 if changed {
                     on_snapshot(this, cx);
@@ -168,6 +295,13 @@ where
             });
             if applied.is_err() {
                 break;
+            }
+
+            if poll_state.pollable_targets().is_empty() {
+                if wake_rx.next().await.is_none() {
+                    break;
+                }
+                continue;
             }
             let sleep = cx
                 .background_executor()
@@ -185,6 +319,7 @@ where
     (
         task,
         SharedSessionPollHandle {
+            control,
             wake: Rc::new(RefCell::new(wake)),
         },
     )
@@ -874,9 +1009,10 @@ pub fn render_agent_session_list(props: AgentSessionListProps<'_>, cx: &App) -> 
     list
 }
 
-/// One virtualized row: either a day header or a session card.
+/// One virtualized row: a section header, custom tmux session, or history card.
 pub enum AgentSessionRow {
     Header(SharedString),
+    Tmux(TmuxSessionSummary),
     Session(AgentSessionItem),
 }
 
@@ -887,6 +1023,121 @@ pub fn flatten_session_sections(sections: Vec<AgentSessionSection>) -> Vec<Agent
         rows.extend(section.sessions.into_iter().map(AgentSessionRow::Session));
     }
     rows
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TmuxSessionRowModel {
+    secondary_label: String,
+    icon_path: String,
+    attach_agent_slug: Option<String>,
+}
+
+fn tmux_session_row_model(session: &TmuxSessionSummary) -> TmuxSessionRowModel {
+    let mut seen = HashSet::new();
+    let agent_slugs: Vec<&str> = session
+        .agent_slugs
+        .iter()
+        .map(String::as_str)
+        .filter(|slug| seen.insert(*slug))
+        .collect();
+    let secondary_label = agent_slugs
+        .iter()
+        .map(|slug| crate::agent::name(slug))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let (icon_path, attach_agent_slug) = match agent_slugs.as_slice() {
+        [slug] => (crate::agent::icon(slug), Some((*slug).to_string())),
+        _ => ("icons/terminal.svg".to_string(), None),
+    };
+    TmuxSessionRowModel {
+        secondary_label,
+        icon_path,
+        attach_agent_slug,
+    }
+}
+
+fn tmux_session_actions(
+    session: &TmuxSessionSummary,
+    model: &TmuxSessionRowModel,
+) -> (
+    workspace_action::AttachTmuxSession,
+    workspace_action::ManageTmuxSession,
+) {
+    (
+        workspace_action::AttachTmuxSession {
+            name: session.name.clone(),
+            agent_slug: model.attach_agent_slug.clone(),
+        },
+        workspace_action::ManageTmuxSession {
+            name: session.name.clone(),
+        },
+    )
+}
+
+fn render_tmux_session_card(session: &TmuxSessionSummary, cx: &App) -> Stateful<Div> {
+    let model = tmux_session_row_model(session);
+    let (attach_action, manage_action) = tmux_session_actions(session, &model);
+
+    div()
+        .id(SharedString::from(format!(
+            "tmux-session-card-{}",
+            session.name
+        )))
+        .w_full()
+        .min_w_0()
+        .px(px(theme::SPACING_MD))
+        .py(px(theme::SPACING_SM))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(rgb(theme::border_subtle(cx)))
+        .bg(rgb(theme::bg_card_dim(cx)))
+        .active(|style| style.bg(theme::row_pressed_bg(cx)))
+        .cursor_pointer()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .on_press(move |_event, window, cx| {
+            platform_bridge::trigger_haptic(HapticFeedback::ImpactLight);
+            window.dispatch_action(attach_action.boxed_clone(), cx);
+        })
+        .on_long_press(move |_event, window, cx| {
+            platform_bridge::trigger_haptic(HapticFeedback::ImpactMedium);
+            window.dispatch_action(manage_action.boxed_clone(), cx);
+        })
+        .child(
+            svg()
+                .path(model.icon_path)
+                .size(px(theme::ICON_MD))
+                .flex_shrink_0()
+                .text_color(rgb(theme::text_muted(cx))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(theme::FONT_BODY))
+                        .text_color(rgb(theme::text_primary(cx)))
+                        .child(session.name.clone()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(theme::FONT_DETAIL))
+                        .text_color(rgb(theme::text_muted(cx)))
+                        .child(model.secondary_label),
+                ),
+        )
 }
 
 pub fn new_session_list_state(row_count: usize) -> ListState {
@@ -923,6 +1174,9 @@ pub fn render_virtualized_agent_session_list(
         };
         let content = match row {
             AgentSessionRow::Header(label) => section_header(label, cx).into_any_element(),
+            AgentSessionRow::Tmux(session) => {
+                render_tmux_session_card(session, cx).into_any_element()
+            }
             AgentSessionRow::Session(item) => render_session_card(
                 SessionCardProps {
                     session: &item.session,
@@ -985,9 +1239,12 @@ fn day_label(at: Option<DateTime<Utc>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSessionItem, AgentSessionSummary, AgentShareSession, SharedSessionStatus,
-        group_sessions_by_day, merge_shared_sessions, offers_terminate, shared_session_status,
+        AgentSessionItem, AgentSessionSummary, AgentShareSession, SharedSessionPollControl,
+        SharedSessionPollState, SharedSessionStatus, TmuxSessionSummary, group_sessions_by_day,
+        merge_shared_sessions, offers_terminate, shared_session_status, tmux_session_actions,
+        tmux_session_row_model,
     };
+    use crate::workspace_state::AgentSharedSessions;
     use chrono::Utc;
     use zedra_rpc::proto::AgentResumeSummary;
 
@@ -1022,41 +1279,63 @@ mod tests {
         }
     }
 
+    fn snapshot(
+        slug: &str,
+        available: bool,
+        sessions: Vec<AgentShareSession>,
+    ) -> AgentSharedSessions {
+        let mut snapshot = AgentSharedSessions::default();
+        snapshot.slug = slug.into();
+        snapshot.available = available;
+        snapshot.sessions = sessions;
+        snapshot
+    }
+
     #[test]
-    fn merge_groups_by_persisted_times_and_attaches_only_own_live_shares() {
+    fn merge_groups_by_persisted_times_and_matches_full_agent_identity() {
         let older = summary("pi", "old", 48);
         let newer = summary("pi", "new", 1);
-        let foreign = summary("hermes", "other", 2);
-        let shares = vec![share("old", false), share("other", false)];
+        let omp_same_id = summary("omp", "old", 2);
+        let foreign = summary("hermes", "old", 3);
+        let snapshots = vec![
+            snapshot("pi", true, vec![share("old", false)]),
+            snapshot("omp", true, vec![share("old", true)]),
+        ];
 
         let sections = group_sessions_by_day(merge_shared_sessions(
-            vec![older, newer, foreign],
-            "pi",
-            &shares,
+            vec![older, newer, omp_same_id, foreign],
+            &snapshots,
         ));
         let items: Vec<&AgentSessionItem> = sections
             .iter()
             .flat_map(|section| section.sessions.iter())
             .collect();
 
-        // Newest first by persisted times; the live "old" row stays last, and
-        // the foreign-slug row never picks up a share from the Pi snapshot.
-        let ids: Vec<&str> = items
+        // Persisted times control ordering; same session ids in different
+        // agent namespaces receive only their own live snapshot.
+        let identities: Vec<(&str, &str)> = items
             .iter()
-            .map(|item| item.session.session_id.as_str())
+            .map(|item| (item.session.slug.as_str(), item.session.session_id.as_str()))
             .collect();
-        assert_eq!(ids, ["new", "other", "old"]);
         assert_eq!(
-            items[2].shared.as_ref().map(|s| s.session_id.as_str()),
-            Some("old")
+            identities,
+            [
+                ("pi", "new"),
+                ("omp", "old"),
+                ("hermes", "old"),
+                ("pi", "old")
+            ]
         );
-        assert!(items[0].shared.is_none() && items[1].shared.is_none());
+        assert!(items[0].shared.is_none());
+        assert!(items[1].shared.as_ref().unwrap().dead);
+        assert!(items[2].shared.is_none());
+        assert!(!items[3].shared.as_ref().unwrap().dead);
     }
 
     #[test]
     fn merge_keeps_dead_panes_attached_with_exit_code() {
-        let items =
-            merge_shared_sessions(vec![summary("pi", "dead", 3)], "pi", &[share("dead", true)]);
+        let snapshots = vec![snapshot("pi", true, vec![share("dead", true)])];
+        let items = merge_shared_sessions(vec![summary("pi", "dead", 3)], &snapshots);
         let shared = items[0].shared.as_ref().expect("dead pane still shared");
         assert!(shared.dead);
         assert_eq!(shared.exit_code, Some(7));
@@ -1065,31 +1344,98 @@ mod tests {
     #[test]
     fn merge_never_fabricates_history_for_unlisted_shares() {
         let row = summary("pi", "known", 3);
-        let items = merge_shared_sessions(
-            vec![row.clone()],
+        let snapshots = vec![snapshot(
             "pi",
-            &[share("known", false), share("ghost", false)],
-        );
+            true,
+            vec![share("known", false), share("ghost", false)],
+        )];
+        let items = merge_shared_sessions(vec![row.clone()], &snapshots);
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].session, row);
     }
 
     #[test]
-    fn merge_collapses_duplicate_snapshot_entries_to_first() {
+    fn merge_uses_first_duplicate_and_ignores_unavailable_snapshots() {
         let mut duplicate = share("dup", false);
         duplicate.title = Some("second".into());
+        let snapshots = vec![
+            snapshot(
+                "pi",
+                true,
+                vec![share("dup", false), duplicate, share("other", false)],
+            ),
+            snapshot("omp", false, vec![share("dup", false)]),
+        ];
 
         let items = merge_shared_sessions(
-            vec![summary("pi", "dup", 3)],
-            "pi",
-            &[share("dup", false), duplicate],
+            vec![summary("pi", "dup", 3), summary("omp", "dup", 2)],
+            &snapshots,
         );
 
         assert_eq!(
             items[0].shared.as_ref().unwrap().title.as_deref(),
             Some("live")
         );
+        assert!(items[1].shared.is_none());
+    }
+
+    #[test]
+    fn downgraded_poll_targets_resume_on_refresh_or_target_change() {
+        let mut control =
+            SharedSessionPollControl::new(vec!["pi".into(), "omp".into(), "pi".into()]);
+        let mut state = SharedSessionPollState::new(&control);
+        assert_eq!(state.pollable_targets(), ["pi", "omp"]);
+
+        state.park_all();
+        assert!(state.pollable_targets().is_empty());
+        assert!(!control.set_targets(vec!["pi".into(), "omp".into()]));
+        state.sync(&control);
+        assert!(state.pollable_targets().is_empty());
+
+        control.request_refresh();
+        state.sync(&control);
+        assert_eq!(state.pollable_targets(), ["pi", "omp"]);
+
+        state.park_all();
+        assert!(state.pollable_targets().is_empty());
+        assert!(control.set_targets(vec!["omp".into(), "claude".into()]));
+        state.sync(&control);
+        assert_eq!(state.pollable_targets(), ["omp", "claude"]);
+    }
+
+    #[test]
+    fn tmux_row_uses_single_agent_label_icon_and_attach_identity() {
+        let session = TmuxSessionSummary {
+            name: "cars_us".into(),
+            agent_slugs: vec!["pi".into()],
+        };
+        let model = tmux_session_row_model(&session);
+        let (attach, manage) = tmux_session_actions(&session, &model);
+
+        assert_eq!(model.secondary_label, "Pi");
+        assert_eq!(model.icon_path, "icons/pi.svg");
+        assert_eq!(model.attach_agent_slug.as_deref(), Some("pi"));
+        assert_eq!(attach.name, "cars_us");
+        assert_eq!(attach.agent_slug.as_deref(), Some("pi"));
+        assert_eq!(manage.name, "cars_us");
+    }
+
+    #[test]
+    fn tmux_row_uses_terminal_icon_and_all_distinct_agent_names_for_multiple_agents() {
+        let session = TmuxSessionSummary {
+            name: "review swarm".into(),
+            agent_slugs: vec!["pi".into(), "claude".into(), "pi".into()],
+        };
+        let model = tmux_session_row_model(&session);
+        let (attach, manage) = tmux_session_actions(&session, &model);
+
+        assert_eq!(model.secondary_label, "Pi · Claude Code");
+        assert_eq!(model.icon_path, "icons/terminal.svg");
+        assert_eq!(model.attach_agent_slug, None);
+        assert_eq!(attach.name, "review swarm");
+        assert_eq!(attach.agent_slug, None);
+        assert_eq!(manage.name, "review swarm");
     }
 
     #[test]

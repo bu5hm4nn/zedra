@@ -388,6 +388,9 @@ All Git result types carry `error: Option<String>`. Host sends error when git re
 - `AgentList(AgentListReq) -> AgentListResult`
 - `AgentShareList(AgentShareListReq) -> AgentShareListResult`
 - `AgentShareTerminate(AgentShareTerminateReq) -> AgentShareTerminateResult`
+- `TmuxSessionList(TmuxSessionListReq) -> TmuxSessionListResult`
+- `TmuxSessionAttach(TmuxSessionAttachReq) -> TmuxSessionAttachResult`
+- `TmuxSessionTerminate(TmuxSessionTerminateReq) -> TmuxSessionTerminateResult`
 - `AgentSessions(AgentSessionsReq) -> AgentSessionsResult`
 - `AgentResume(AgentResumeReq) -> AgentResumeResult`
 - `AgentInstalledList(AgentInstalledListReq) -> AgentInstalledListResult`
@@ -432,34 +435,38 @@ their history per workspace; `hermes` is global.
 
 Some actors can run a session inside a host-owned tmux session so independent
 terminal clients (e.g. macOS SSH) attach to the same pane. The host's tmux
-namespace (`zedra-pi-<hex(session_id)>`, `crates/zedra-host/src/tmux.rs`) is
-authoritative for ownership; Pi is the only actor with the capability today
-(`AgentActor::supports_shared_sessions`, registry-gated — no per-slug RPC
-logic).
+namespace is `zedra-<slug>-<hex(session_id)>`
+(`crates/zedra-host/src/tmux.rs`). Pi and OMP currently opt in through
+`AgentActor::supports_shared_sessions`; the actor registry remains the
+capability authority, with no per-slug RPC logic.
 
 - `AgentShareListReq.slug` selects the actor. Unknown slugs and actors without
-  the capability return `available: false` with an `error` reason; they do not
+  the capability return `supported: false`, `available: false`; they do not
   fail the RPC.
-- `AgentShareListResult.available` is false when the host has no usable tmux
-  (binary missing, below tmux 3.3a) or the agent cannot share sessions; `error`
-  then carries the exact actionable reason. `version` is the host tmux version
-  when tmux is usable, empty otherwise. Persisted session history
-  (`AgentSessions`) is unaffected by tmux availability — a host without tmux
-  still returns its normal history there.
+- `AgentShareListResult.supported` is true only when the registered actor opts
+  into shared sessions. `available` is true only when `supported` is true and
+  the host successfully discovers and lists sessions through a usable tmux
+  (version 3.3a or newer). A supported actor with missing, too-old, or failing
+  tmux returns `supported: true`, `available: false` and an actionable `error`.
+  `version` is the host tmux version when tmux is usable, empty otherwise.
+  Persisted session history (`AgentSessions`) is unaffected by either value.
 - Each `AgentShareSession` carries the agent's own `session_id` (the same id
   `AgentResume` accepts) plus live tmux metadata: `title`, `cwd`,
   `current_command` (all optional, absent when empty), and `dead`/`exit_code`
   for the pane process. Dead panes stay listed when tmux keeps them
   (`remain-on-exit`); a live pane reports `dead: false`, `exit_code: None`.
-- Only Zedra-owned tmux sessions are listed. Foreign or malformed tmux
-  sessions are silently omitted; there is no screen scraping.
-- `AgentShareTerminate{slug, session_id}` kills the tmux session: the agent
-  process stops and every attached terminal client exits. The host validates
-  the slug and rebuilds the tmux target from the ownership codec, so arbitrary
-  tmux targets are impossible by construction. `terminal_ids` lists the
-  caller's terminals that were attached to the shared session so the client
-  can remove its local cards; it stays empty until terminals carry shared
-  spawn metadata (resume-through-tmux follow-up).
+- Only Zedra-owned tmux sessions for the requested slug are listed. Ownership
+  includes both `slug` and `session_id`, so Pi and OMP sessions with the same
+  provider session id remain isolated. Foreign, malformed, and other-slug
+  sessions are omitted before pane metadata is queried; there is no screen
+  scraping.
+- `AgentShareTerminate{slug, session_id}` kills only the matching actor-owned
+  tmux session: the agent process stops and every attached terminal client
+  exits. The host validates the registry capability and rebuilds the tmux
+  target from both identity components, so arbitrary or cross-actor tmux
+  targets are impossible by construction. `terminal_ids` lists the caller's
+  terminals that were attached to the shared session so the client can remove
+  its local cards.
 - Termination errors (unknown agent, missing/too-old tmux, invalid session
   id, tmux failure) surface in `error` and change no host terminal state.
 - Compatibility: both variants are appended at the `ZedraProto` tail under the
@@ -468,6 +475,54 @@ logic).
   the shared-session calls for that connection
   (`SessionHandle::shared_agent_sessions_supported`) and every other agent or
   terminal feature continues unchanged.
+
+### Custom tmux session conventions
+
+Custom tmux sessions are a separate, non-owned capability. They never enter
+persisted agent history, `AgentShareList`, the Zedra-owned session-name codec,
+or the `(slug, session_id)` ownership and termination path. The capability uses
+only the configured/default tmux server under the host user:
+
+- `TmuxSessionListReq` has no fields. A usable tmux, including one with no
+  detected custom sessions, returns `TmuxSessionListResult { available: true,
+  version, sessions, error: None }`. Missing, too-old, timed-out, or otherwise
+  failing tmux returns `available: false`, an empty `version` and `sessions`,
+  and an actionable `error`.
+- Every `TmuxSessionSummary` contains the byte-exact tmux `name` and
+  `agent_slugs`, the distinct registered actor slugs found across live panes in
+  pane order. Every name beginning with the reserved `zedra-` prefix is
+  excluded, including malformed names; those names remain exclusively inside
+  the owned namespace.
+- Actor detection is informational and registry-only. For each live pane the
+  host applies the canonical registry command detector to the nonempty current
+  command, then to the start command only when the current command is
+  unrecognized. Dead panes and unrecognized commands contribute nothing, and a
+  session with no detected registered actor is omitted. Titles, cwd, screen
+  contents, and ad-hoc raw substring matching are never detection inputs.
+  Multiple detected actors are reported without guessing a single identity.
+- `TmuxSessionAttachReq { name, cols, rows }` creates a normal terminal client
+  only after fresh discovery resolves the byte-exact, non-reserved name and
+  still detects at least one registered actor. Tmux receives the exact target
+  form `=<name>`, so spaces and shell metacharacters remain data. If the session
+  disappeared, or still exists but no longer has a detected actor, attachment
+  fails with no terminal and no shell fallback. Multiple terminals may attach
+  independently; ordinary `TermClose` closes only that attach-client PTY and
+  leaves the tmux session running. Success returns `terminal_id`; failures set
+  `error`.
+- `TmuxSessionTerminateReq { name }` performs the same fresh exact-name,
+  reserved-prefix, and registered-actor revalidation before issuing
+  `kill-session -t =<name>`. A session that disappeared before termination is
+  already terminated and therefore succeeds. Successful or already-complete
+  termination removes matching external attachment terminals and returns their
+  ids in `terminal_ids`. Any other tmux error changes no host terminal state.
+  A raw custom name is never routed through `AgentShareTerminate`.
+- Compatibility: `TmuxSessionList`, `TmuxSessionAttach`, and
+  `TmuxSessionTerminate` are appended in that order at the live `ZedraProto`
+  tail without changing the `zedra/rpc/4` ALPN or its frozen predecessor.
+  An older host rejects the unknown discriminant; the client then disables only
+  these three custom-session calls for that connection. The owned
+  `AgentShare*` capability, persisted agent history, and ordinary terminals
+  remain enabled.
 
 ### Async managed-agent fetching
 
@@ -706,6 +761,32 @@ Any protocol-layer change must include all applicable steps:
 ---
 
 ## 11) Protocol Changelog
+
+### 2026-09-10 (custom tmux sessions)
+
+- Appended `TmuxSessionList`, `TmuxSessionAttach`, and `TmuxSessionTerminate`,
+  in that order, at the live `ZedraProto` tail (§5.8). Their request and result
+  types are new, existing variant positions and the frozen protocol are
+  unchanged, and `ZEDRA_ALPN` remains `zedra/rpc/4`.
+- Custom sessions remain outside Zedra ownership. The new capability exposes
+  only non-`zedra-*` sessions with registry-detected agents, revalidates exact
+  names before attach or termination, and distinguishes attach disappearance
+  (error) from termination disappearance (already complete).
+- On an incompatible response from an older host, the client independently
+  disables only these three RPCs; owned shared sessions, agent history, and
+  ordinary terminals remain available.
+
+### 2026-09-09 (multi-agent shared sessions)
+
+- Extended the registry-gated shared-session capability from Pi to Pi and OMP.
+  Tmux ownership, listing, and termination now use the full
+  `(slug, session_id)` identity, including when both actors use the same
+  provider session id.
+- Added `AgentShareListResult.supported` to distinguish actor capability from
+  tmux runtime availability. This changes only the unreleased response type
+  introduced with the appended shared-session request variants; their enum
+  positions stay unchanged and the existing old-host unknown-variant downgrade
+  remains the compatibility boundary, so `ZEDRA_ALPN` does not change.
 
 ### 2026-09-06 (shared agent sessions)
 

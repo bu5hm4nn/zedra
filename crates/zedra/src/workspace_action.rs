@@ -133,6 +133,19 @@ pub struct ResumeAgentSession {
     pub session_id: String,
 }
 
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = workspace, no_json)]
+pub struct AttachTmuxSession {
+    pub name: String,
+    pub agent_slug: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = workspace, no_json)]
+pub struct ManageTmuxSession {
+    pub name: String,
+}
+
 /// Long-press terminate offer for a session card with a shared tmux snapshot.
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = workspace, no_json)]

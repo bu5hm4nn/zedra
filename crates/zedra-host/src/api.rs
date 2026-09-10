@@ -540,7 +540,7 @@ async fn resume_agent_handler(
             color_scheme: None,
             env: Vec::new(),
             identity_launch_cmd: launch.identity_cmd,
-            shared: launch.shared,
+            backing: launch.backing,
         },
     )
     .await

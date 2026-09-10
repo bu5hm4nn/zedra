@@ -5,9 +5,9 @@ use zedra_rpc::proto::{AgentFile, AgentSessionSummary, AgentSummary, HostEvent};
 use zedra_session::{Session, SessionHandle};
 
 use crate::agent_ui::{
-    AgentSessionListProps, AgentSessionSection, SHARED_SESSION_AGENT_SLUG, SharedSessionPollHandle,
-    cli_version_display, group_sessions_by_day, merge_shared_sessions, render_agent_session_list,
-    render_extra_row, render_usage_row, setup_label, spawn_shared_session_poll,
+    AgentSessionListProps, AgentSessionSection, SharedSessionPollHandle, cli_version_display,
+    group_sessions_by_day, merge_shared_sessions, render_agent_session_list, render_extra_row,
+    render_usage_row, setup_label, spawn_shared_session_poll,
 };
 use crate::file_preview_view::FilePreviewView;
 use crate::fonts;
@@ -38,9 +38,9 @@ pub struct AgentDetail {
     files: Vec<AgentFile>,
     /// Persistent preview for the native file sheet; its content swaps per tap.
     file_preview: Entity<FilePreviewView>,
-    /// Live tmux snapshot for the session list; only Pi detail views poll.
+    /// Live tmux snapshots for the session list.
     workspace_state: Entity<WorkspaceState>,
-    shared_poll: Option<SharedSessionPollHandle>,
+    shared_poll: SharedSessionPollHandle,
     agent_state: LoadState,
     session_state: LoadState,
     loading_epoch: u64,
@@ -58,8 +58,13 @@ impl AgentDetail {
     ) -> Self {
         let file_preview =
             cx.new(|cx| FilePreviewView::new(session_handle.clone(), workspace_state.clone(), cx));
-        // Only Pi can share sessions on the host.
-        let is_shared_capable = slug == SHARED_SESSION_AGENT_SLUG;
+        let (poll_task, poll_handle) = spawn_shared_session_poll(
+            session_handle.clone(),
+            workspace_state.clone(),
+            vec![slug.clone()],
+            |this, cx| this.rebuild_sections(cx),
+            cx,
+        );
         let mut view = Self {
             slug,
             agent: None,
@@ -68,23 +73,13 @@ impl AgentDetail {
             files: Vec::new(),
             file_preview,
             workspace_state,
-            shared_poll: None,
+            shared_poll: poll_handle,
             agent_state: LoadState::Loading,
             session_state: LoadState::Loading,
             loading_epoch: 0,
             session_handle,
-            _tasks: Vec::new(),
+            _tasks: vec![poll_task],
         };
-        if is_shared_capable {
-            let (poll_task, poll_handle) = spawn_shared_session_poll(
-                view.session_handle.clone(),
-                view.workspace_state.clone(),
-                |this, cx| this.rebuild_sections(cx),
-                cx,
-            );
-            view.shared_poll = Some(poll_handle);
-            view._tasks.push(poll_task);
-        }
         view.subscribe_agent_info(session, cx);
         view.reload(false, cx);
         view
@@ -126,9 +121,7 @@ impl AgentDetail {
 
     fn reload(&mut self, refresh: bool, cx: &mut Context<Self>) {
         if refresh {
-            if let Some(poll) = &self.shared_poll {
-                poll.request_refresh();
-            }
+            self.shared_poll.request_refresh();
         }
         self.loading_epoch = self.loading_epoch.wrapping_add(1);
         let epoch = self.loading_epoch;
@@ -190,18 +183,9 @@ impl AgentDetail {
 
     /// Re-derive sections from persisted rows plus the live tmux snapshot.
     fn rebuild_sections(&mut self, cx: &mut Context<Self>) {
-        let slug = self.slug.clone();
-        let shares = if slug == SHARED_SESSION_AGENT_SLUG {
-            self.workspace_state
-                .read(cx)
-                .shared_sessions(SHARED_SESSION_AGENT_SLUG)
-                .map(|entry| entry.sessions.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let snapshots = self.workspace_state.read(cx).shared_sessions.clone();
         self.sections =
-            group_sessions_by_day(merge_shared_sessions(self.sessions.clone(), &slug, &shares));
+            group_sessions_by_day(merge_shared_sessions(self.sessions.clone(), &snapshots));
         cx.notify();
     }
 

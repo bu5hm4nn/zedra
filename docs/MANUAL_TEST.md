@@ -2403,92 +2403,304 @@ fails and exits. `zedra codex resume` prompts instead. No model call is needed:
 7. From the app, tap a session open in a desktop terminal: the terminal shows
    the same prompt. Tap one open nowhere: codex resumes with no prompt.
 
-## 29. Shared Pi Sessions Over tmux
+## 28. iOS App on Apple-silicon Mac (Designed for iPad)
 
-Release gate for tmux-backed Pi session sharing. Prerequisites: the host runs
-this branch with `tmux` on PATH (`tmux -V`), and a saved Pi session exists in
-the workspace (`zedra agent sessions pi` or the app's Pi detail view). Use one
-iOS Simulator as the Zedra client. An unset `tmux.socket` uses tmux's standard
-socket under `/tmp`; a gateway uses an absolute persistent socket in the global
-config so sessions survive container recreation.
+Runs the existing ios-arm64 app in macOS's iOS compatibility environment — not
+Simulator, not Catalyst. Prerequisites: Xcode with the iOS platform component
+installed, code signing for a team this Mac's Xcode account can use, and
+Automation permission when macOS asks (launch goes through Xcode's run
+action). `./scripts/run-ios.sh mac` builds the `aarch64-apple-ios` slice, then
+builds and launches via Xcode.
 
-### Setup and live status
+1. Run `./scripts/run-ios.sh mac --no-telemetry`. Expected: Rust builds for
+   `aarch64-apple-ios`, Xcode selects `platform=macOS,variant=Designed for iPad`,
+   and `Zedra Dev` opens as a macOS window with the Home screen rendered at the
+   window bounds.
+2. Resize the window. Expected: content and the pinned key bar stay aligned to
+   the window, not the full display.
+3. Connect to a host workspace and focus the terminal. Type on the physical Mac
+   keyboard. Expected: input reaches the shell — characters commit at Enter
+   (known limitation above) — and output renders live.
+4. Open Settings → Developer and trigger the native alert and selection
+   presentations. Expected: each appears over the GPUI window and returns
+   control without leaving the window occluded.
+5. Open an external link and an in-app webview. Expected: the browser opens for
+   the external link; the webview presents over the window and dismisses cleanly.
+6. Pair via deep link: `target/debug/zedra qr --workdir <ws> --json`, then
+   `/usr/bin/open '<pairing_url>'`. Expected: the running client receives the
+   `zedra://connect?ticket=...` URL and connects to the workspace.
+7. Quit the app and rerun `./scripts/run-ios.sh mac --no-build`. Expected: the
+   saved workspace is still listed and reconnects.
+8. Open Scan QR with no usable camera. Expected: `Upload Image` presents the
+   photo picker; selecting a screenshot containing the host QR follows the same
+   pairing flow.
 
-1. Run `zedra start` on the host. In the app, connect to the workspace and
-   open the Pi agent detail view (or the global agent-sessions view).
-2. Expected: persisted Pi history renders as before, and a row whose session
-   is currently running under tmux shows a green `Live` badge; dead panes show
-   muted `Ended` or `Ended (code N)`.
-3. Leave the sessions view open for several seconds. Expected: the shared
-   snapshot refreshes roughly every 2 seconds without disturbing scroll
-   position, and rows without a live tmux session keep their past-only look.
-4. Run `tmux ls` on the host. Expected: only `zedra-pi-<hex>` names appear from
-   Zedra; foreign sessions the user created themselves are never listed in the
-   app.
+### Known Mac limitations
 
-### Simultaneous SSH and Zedra clients
+- **Physical keyboard echo**: hardware keys reach the shell, but typed
+  characters commit as a batch when Enter is pressed instead of echoing live.
+  The Mac compatibility runtime routes hardware keys through the same
+  streamed/marked-text input path the mobile keyboard uses, and terminals
+  commit that text lazily. Mouse input, output rendering, and pairing are
+  unaffected.
+- **Scroll wheel**: drag-scrolling works; the mouse wheel does not scroll
+  (the compatibility environment does not translate wheel events into the pan
+  gestures GPUI consumes).
+- **UI scale**: resizing re-lays-out content to the window, but the iPad-sized
+  UI simply renders smaller on a Mac display; there is no zoom control.
 
-1. Resume a saved Pi session from the app. Expected: a terminal card opens.
-2. From the gateway client, run `ssh zedra-pi 'pi:<session-id>'`. Expected:
-   the restricted wrapper attaches to the same pane without creating a shell;
-   both the SSH terminal and the Zedra card show the same output, and typing in
-   one appears in the other.
-3. In the app, open a second card for the same session (tap the row again).
-   Expected: two cards attach to the same tmux session, both stay in sync, and
-   closing one card leaves Pi and the other card running.
-4. Type in both cards at once. Expected: both inputs reach Pi without dropping
-   either.
-5. Resize: put a desktop-sized Zedra card beside a phone-shaped one (e.g. one
-   at 120 columns, the other 38x100 portrait). Expected: the pane takes the
-   maximum width and the maximum height across clients independently — e.g.
-   120x99 for a 120x40 desktop plus a 38x100 phone, not 120x39. The desktop
-   client scrolls rows outside its height. Detaching the largest client drops
-   the pane to the next largest; re-attaching restores it.
-6. Run a command that changes the cwd and one that sets the window title
-   (OSC 0). Expected: the app's `AgentShareList` metadata picks up the new
-   title and cwd within the 2s poll (compare `tmux list-panes -t zedra-pi-<hex>
-   -F '#{pane_title}|#{pane_current_path}'`).
-7. Scroll back in a freshly opened card. Expected: only output since this
-   attachment is in the card's scrollback. To read older output, use tmux copy
-   mode in the attached `ssh zedra-pi 'pi:<session-id>'` client (prefix + `[`);
-   it is not replayed into the Zedra card.
+## 29. Shared Pi and OMP Sessions Over tmux
 
-### Close, terminate, and restart
+Release gate for tmux-backed Pi and OMP session sharing. Run the host from this
+branch with tmux 3.3a or newer on PATH. Prepare saved Pi and OMP sessions in the
+same workspace; the same-ID isolation steps require provider-valid test history
+for both actors with the same literal session ID. Use one iOS Simulator first
+and a second Zedra device for the handoff steps.
 
-1. Close each Zedra card in turn. Expected: Pi keeps running under tmux
-   (`tmux ls` still lists the session) and the SSH client never loses the
-   pane; the sessions row stays `Live`.
-2. From the sessions view, long-press a row with a shared snapshot. Expected:
-   a medium haptic and a destructive confirmation (`Terminate shared session?`
-   — `This stops Pi and disconnects every attached terminal.`). Cancel keeps
-   everything unchanged.
-3. Confirm `Terminate` with the SSH client still attached. Expected: the tmux
-   session and the Pi process are gone (`tmux ls` no longer lists it, the SSH
-   client exits), the app's matching cards close, the row falls back to past
-   history, and other terminals are untouched.
-4. Resume the session again, then kill the tmux server on the host (`tmux
-   kill-server` or killing the server process). Expected: within the poll
-   interval the row loses its `Live` badge and shows only the persisted
-   history state — the app falls back to past-only data rather than showing a
-   stale live entry.
-5. Restart `zedra start` while a shared session is live (tmux survives). Then
-   reconnect the app. Expected: the shared session re-attaches and the `Live`
-   badge returns; the tmux session was preserved across the host restart.
-6. With a shared Pi session live, pair a second Zedra device and have both
-   connect at the same time. Expected: the second device is blocked with
-   `Host occupied` exactly as in section 6 — shared sessions do not change the
-   one-active-client rule.
-7. Disconnect the first device entirely, then attach the second device and
-   resume the same session. Expected: sequential handoff works; the second
-   device attaches to the same live tmux session.
+Run every tmux command against the socket selected by the host. With no
+`tmux.socket`, use plain `tmux`; it selects tmux's standard socket, usually under
+`/tmp`. With a configured absolute `tmux.socket`, use
+`tmux -S <tmux.socket>` for every manual, SSH, list, attach, and cleanup command.
+A persistent path on a mounted volume lets a gateway keep sessions through
+container recreation.
+
+| Actor | History command | Owned target | Actor-owned resume command |
+| --- | --- | --- | --- |
+| Pi | `zedra agent sessions pi` | `zedra-pi-<hex(session_id)>` | `pi --session <session-id>` |
+| OMP | `zedra agent sessions omp` | `zedra-omp-<hex(session_id)>` | `omp --resume <session-id>` |
+
+### Setup and live status matrix
+
+1. Run `tmux -V`; expected: version 3.3a or newer. Run both history commands in
+   the matrix. Expected: each command lists only that actor's workspace history,
+   including the saved ID used below.
+2. Run `zedra start`, connect the app to the workspace, and open the Pi detail
+   view, the OMP detail view, and the aggregate agent-sessions view. Expected:
+   both detail views and the aggregate view show the same persisted rows and
+   ordering as the CLI histories.
+3. Resume a saved Pi row, then a saved OMP row. Expected: each opens a terminal
+   card using the command in the matrix; there is no direct-resume terminal.
+4. Hex-encode each session ID as raw UTF-8 bytes with
+   `printf '%s' '<session-id>' | xxd -p -c 256`, then run `tmux list-sessions`.
+   Expected: Pi uses exactly `zedra-pi-<hex(session_id)>`, OMP uses exactly
+   `zedra-omp-<hex(session_id)>`, and no other Zedra target is created. Inspect
+   each with `tmux list-panes -t <target> -F '#{pane_start_command}'`; expected:
+   its inner command is the actor-owned command in the matrix, with the session
+   ID shell-quoted as needed.
+5. Return to each actor detail view. Expected: its resumed row shows a green
+   `Live` badge within about 2 seconds. Open the aggregate view. Expected: both
+   matching rows show `Live`; another actor's row with a different ID or slug
+   does not inherit either badge.
+6. Leave each view open for several poll cycles. Expected: title, cwd, and live
+   state refresh roughly every 2 seconds without moving the scroll position.
+   Historical rows without a matching tmux pane stay unbadged and cannot be
+   terminated.
+7. Create a foreign tmux session with a name outside the
+   `zedra-<slug>-<hex(session_id)>` codec. Expected: it never appears in either
+   detail view or the aggregate view.
+
+### Same-ID isolation and independent clients
+
+1. With the same-ID history fixtures active, resume Pi and OMP using the shared
+   `<same-id>`. Expected: both `zedra-pi-<hex(same-id)>` and
+   `zedra-omp-<hex(same-id)>` exist at once, and both matching history rows show
+   `Live`.
+2. From two desktop shells, or from two SSH shells on the gateway, run
+   `tmux attach-session -t zedra-pi-<hex(same-id)>` and
+   `tmux attach-session -t zedra-omp-<hex(same-id)>`. Include
+   `-S <tmux.socket>` when configured. Expected: each manual client attaches to
+   its actor's pane without starting a shell or another agent process.
+3. Type in the Pi card and its manual client, then in the OMP card and its
+   manual client. Expected: input and output are shared within each pair and
+   never cross between the same-ID Pi and OMP panes.
+4. Tap each same-ID row again to open a second Zedra card. Expected: every card
+   is an independent tmux client; two cards can attach to each actor at once and
+   stay in sync with its manual client.
+5. Put a desktop-sized client beside a phone-shaped client, such as 120x40 and
+   38x100. Expected: `window-size largest` selects the maximum width and height
+   independently, yielding 120x99 for this pair. Detaching the largest client
+   shrinks the pane to the next largest; reattaching restores it.
+6. In each actor pane, change cwd and emit an OSC 0 window title. Compare the
+   app with
+   `tmux list-panes -t <target> -F '#{pane_title}|#{pane_current_path}'`.
+   Expected: only the matching actor row receives the sanitized title and cwd
+   within the next poll.
+7. Open a fresh card for each actor and scroll backward. Expected: the card
+   contains output only from its attachment time. Older output remains
+   available in the matching manual client's tmux copy mode (prefix + `[`) and
+   is not replayed into the Zedra card.
+
+### Detach, terminate, dead panes, and restart
+
+1. Close the Zedra cards one at a time while leaving the manual clients
+   attached. Expected: closing detaches only that card. Both agent processes,
+   tmux sessions, manual clients, and `Live` badges remain.
+2. Long-press the live OMP row. Expected: a medium haptic and
+   `Terminate shared session?` with the exact body
+   `This stops the agent session and disconnects every attached terminal.`
+   Cancel. Expected: both actors, every card, and both manual clients remain
+   unchanged.
+3. Long-press OMP again and confirm `Terminate`. Expected: only
+   `zedra-omp-<hex(same-id)>` and the OMP process exit; OMP cards close and its
+   manual client disconnects. The Pi same-ID target, process, cards, client, and
+   `Live` badge remain. OMP's persisted history row remains without a live
+   badge. Resume OMP, repeat with Pi, and expect the inverse isolation.
+4. Resume both actors. Stop and restart `zedra start` without stopping tmux,
+   then reconnect the app. Expected: both tmux sessions survive, both detail
+   views and the aggregate view recover `Live`, and later resumes attach to the
+   existing targets instead of starting duplicate processes.
+5. For each actor in turn, force a known dead-pane result on its target, for
+   example with
+   `tmux respawn-pane -k -t <target> 'sh -c "exit 7"'`.
+   Expected: only that actor's matching detail and aggregate rows change to
+   muted `Ended (code 7)` within a poll. A dead pane with no exit status shows
+   `Ended`; the other actor remains live.
+6. Resume both actors again. Pair Device B while Device A remains connected.
+   Expected: Device B gets `Host occupied`, preserving the one-active-Zedra-
+   client rule even though manual tmux clients remain independently attached.
+7. Disconnect Device A completely, connect Device B, and resume both saved
+   rows. Expected: sequential handoff attaches Device B to the existing Pi and
+   OMP targets; neither agent process restarts and the manual clients stay
+   connected.
 
 ### Without tmux
 
-1. Run the host with `tmux` made unavailable (e.g. a controlled `PATH` without
-   it, so the binary cannot be discovered).
-2. Open the sessions view and the Pi detail view. Expected: persisted history
-   stays fully usable; the app logs one contextual warning about the
-   unavailable shared-session feature and shows no persistent banner.
-3. Resume a known Pi session. Expected: an actionable resume error naming the
-   missing capability — no direct-resume fallback and no terminal card.
-   Fresh Pi launches (new session, no known ID) still work as plain PTY
+1. Stop the host and restart it with a controlled PATH from which `tmux` cannot
+   be discovered. Open the Pi detail view, OMP detail view, and aggregate view.
+   Expected: both actors' persisted histories remain usable, live snapshots
+   clear, one contextual infrastructure warning per actor is logged for the
+   unavailable stretch, and the app shows no persistent banner.
+2. Leave the aggregate view open for several cycles, then manually refresh.
+   Expected: Pi and OMP remain on the normal supported-agent retry cadence;
+   neither warning repeats until that actor's availability recovers and fails
+   again.
+3. Resume a known Pi session and a known OMP session. Expected: each shows an
+   actionable tmux error, creates no terminal card, and never falls back to a
+   direct resumed process.
+4. Start a fresh Pi session and a fresh OMP session without selecting a saved
+   ID. Expected: both still launch as direct PTY children because their provider
+   session IDs are not known before spawn.
+5. Restore tmux on PATH and refresh. Expected: shared status becomes available
+   again, existing owned targets are discovered by slug, and subsequent
+   known-session resumes use tmux.
+
+### Custom tmux sessions
+
+This matrix covers non-owned tmux sessions separately from the encoded Pi and
+OMP targets above. Keep at least one persisted agent-history row in the
+workspace throughout the matrix. Use the same tmux socket as the host, following
+the `tmux -S <tmux.socket>` rule at the start of this section.
+
+1. Create blocking, local fixtures whose executable names are recognized
+   without authentication or network access, then create the custom, unsupported,
+   multi-agent, and reserved sessions:
+
+   ```bash
+   FIXTURE_DIR="$(mktemp -d)"
+   cp "$(command -v cat)" "$FIXTURE_DIR/pi"
+   cp "$(command -v cat)" "$FIXTURE_DIR/omp"
+   cp "$(command -v cat)" "$FIXTURE_DIR/claude"
+   chmod +x "$FIXTURE_DIR/pi" "$FIXTURE_DIR/omp" "$FIXTURE_DIR/claude"
+
+   tmux new-session -d -s cars_us "$FIXTURE_DIR/pi"
+   tmux new-session -d -s claude_custom "$FIXTURE_DIR/claude"
+   tmux new-session -d -s mixed_agents "$FIXTURE_DIR/pi"
+   tmux split-window -d -t '=mixed_agents' "$FIXTURE_DIR/omp"
+   tmux split-window -d -t '=mixed_agents' "$FIXTURE_DIR/pi"
+   tmux new-session -d -s shell_only /bin/sh
+   tmux new-session -d -s zedra-pi-6d616e75616c2d636f6e74726f6c "$FIXTURE_DIR/pi"
+   tmux new-session -d -s zedra-malformed "$FIXTURE_DIR/pi"
+   ```
+
+   Expected: all six sessions exist on the selected server. `cars_us` has one
+   detected Pi pane, `claude_custom` has one detected Claude pane, and
+   `mixed_agents` has Pi, OMP, and a duplicate Pi pane. `shell_only` has no
+   registered actor. Both names beginning with `zedra-` are reserved, regardless
+   of whether the remainder is a valid owned-session encoding.
+2. Connect the app and open the existing `View sessions` / Resume Session
+   surface. Expected: the first section is `Tmux sessions`, ahead of the normal
+   Today/Yesterday date groups. It contains `cars_us`, `claude_custom`, and
+   `mixed_agents` in tmux enumeration order. It does not contain `shell_only`,
+   the encoded `zedra-pi-*` control, or the malformed `zedra-*` control.
+3. Expected row details: the primary labels are the exact tmux names;
+   `cars_us` has the Pi icon and `Pi` secondary label; `claude_custom` has the
+   Claude icon and `Claude Code` secondary label; and `mixed_agents` has the
+   generic terminal icon and the deduplicated `Pi · Omp` secondary label in pane
+   detection order.
+4. Compare the history below the custom section with its pre-fixture state.
+   Expected: every persisted row, date group, live badge, and resume action is
+   unchanged. No custom row is fabricated as agent history or inserted into a
+   date group. Toggle the device between light and dark appearance. Expected:
+   the custom header and cards remain legible and use the same spacing, borders,
+   pressed styling, and theme colors as the history cards.
+5. Before tapping `cars_us`, record its pane PID with
+   `tmux display-message -p -t '=cars_us' '#{pane_pid}'`. Tap the `cars_us` row.
+   Expected: a normal Zedra terminal card opens, attached to that exact session;
+   no new tmux session, resumed provider session, or fallback shell is created.
+6. From a desktop shell, run `tmux attach-session -t '=cars_us'`. Type lines in
+   the desktop client and in the Zedra card. Expected: both clients show the
+   same bidirectional pane input/output. Tap the `cars_us` row again. Expected:
+   a second independent Zedra terminal card attaches and stays synchronized
+   with the first card and desktop client.
+7. Close one Zedra card through the normal terminal-card close flow. Expected:
+   only that attach-client PTY closes; the other Zedra card and desktop client
+   remain attached. `tmux has-session -t '=cars_us'` still succeeds and the pane
+   PID recorded in step 5 is unchanged. Close the second Zedra card. Expected:
+   `cars_us`, its pane PID, and the desktop client still survive.
+8. Reopen two Zedra attachments to `cars_us`, then long-press its row. Expected:
+   medium haptic feedback and a native sheet titled `cars_us` with destructive
+   `Terminate Session` and `Cancel` actions. Tap `Cancel`. Expected: the sheet
+   closes without changing any tmux session, pane, desktop client, or terminal
+   card.
+9. Long-press `cars_us` again, select `Terminate Session`, and inspect the
+   confirmation. Expected: title `Terminate tmux session?`, body
+   `This stops every process in “cars_us” and disconnects every attached
+   terminal.`, and `Terminate` / `Cancel` buttons. Tap `Cancel`. Expected:
+   `cars_us` and all of its clients remain unchanged.
+10. Repeat step 9 and tap `Terminate`. Expected: only `cars_us` and its pane
+    stop; its desktop client disconnects, both matching Zedra terminal cards
+    close through the normal terminal lifecycle, and the `cars_us` row
+    disappears on the next poll. `claude_custom`, `mixed_agents`, `shell_only`,
+    both reserved controls, their panes, and any terminals attached to them
+    remain unchanged. Persisted agent history and owned Pi/OMP live sessions
+    also remain unchanged.
+11. Recreate `cars_us` with
+    `tmux new-session -d -s cars_us "$FIXTURE_DIR/pi"`. Stop and restart
+    `zedra-host` without stopping the selected tmux server, reconnect the app,
+    and reopen View sessions. Expected: every surviving supported custom
+    session, including the recreated `cars_us`, survives and is rediscovered at
+    the top of the list with the same labels; attaching `cars_us` works again.
+12. Create a race fixture with
+    `tmux new-session -d -s race_pi "$FIXTURE_DIR/pi"`, wait for `race_pi` to
+    appear in `Tmux sessions`, then from another shell run
+    `tmux kill-session -t '=race_pi'` and immediately tap the still-visible row
+    before the next two-second poll. Expected: no shell fallback and no terminal
+    card remains, including the temporary `Attaching race_pi…` card. The app
+    returns to the previous/default route and shows `Attach Tmux Session` with
+    `Failed to attach to the tmux session.` followed by the actionable host
+    error. If polling removes the row before it can be tapped, recreate the
+    fixture and repeat.
+13. Stop the host and restart the same workspace with an absolute `zedra`
+    executable and a controlled `PATH` that cannot find `tmux`. Reconnect and
+    open View sessions. Expected: only the `Tmux sessions` section disappears;
+    persisted Agent History, its grouping and resume rows, and ordinary
+    terminals remain usable. No stale custom rows or persistent error banner
+    remains. Restore the normal `PATH`, restart the host, and expected: the
+    supported custom rows rediscover.
+14. Start a host version from before the custom-tmux RPCs, connect the current
+    app, and open View sessions. Expected: the custom section is omitted without
+    breaking or hiding persisted history. Ordinary terminals and that host's
+    existing owned Pi/OMP shared-session behavior remain usable; the
+    incompatible custom capability does not disable their RPCs or produce a
+    repeated visible error.
+15. Cleanup against the selected socket:
+
+    ```bash
+    tmux kill-session -t '=cars_us'
+    tmux kill-session -t '=claude_custom'
+    tmux kill-session -t '=mixed_agents'
+    tmux kill-session -t '=shell_only'
+    tmux kill-session -t '=zedra-pi-6d616e75616c2d636f6e74726f6c'
+    tmux kill-session -t '=zedra-malformed'
+    rm -rf "$FIXTURE_DIR"
+    ```

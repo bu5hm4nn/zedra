@@ -277,6 +277,22 @@ pub enum ZedraProto {
     /// Kept at enum tail because protocol variants are append-only.
     #[rpc(tx = oneshot::Sender<AgentShareTerminateResult>)]
     AgentShareTerminate(AgentShareTerminateReq),
+
+    /// Discover non-owned tmux sessions that contain a registered agent.
+    /// Kept at enum tail because protocol variants are append-only.
+    #[rpc(tx = oneshot::Sender<TmuxSessionListResult>)]
+    TmuxSessionList(TmuxSessionListReq),
+
+    /// Attach a terminal client to one exact, freshly revalidated custom tmux
+    /// session.
+    /// Kept at enum tail because protocol variants are append-only.
+    #[rpc(tx = oneshot::Sender<TmuxSessionAttachResult>)]
+    TmuxSessionAttach(TmuxSessionAttachReq),
+
+    /// Terminate one exact, freshly revalidated custom tmux session.
+    /// Kept at enum tail because protocol variants are append-only.
+    #[rpc(tx = oneshot::Sender<TmuxSessionTerminateResult>)]
+    TmuxSessionTerminate(TmuxSessionTerminateReq),
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,10 +1607,8 @@ pub struct AgentShareSession {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentShareListResult {
-    /// False when the host has no usable tmux (missing binary, too old) or the
-    /// agent lacks the shared-session capability; `error` then carries the
-    /// reason. Persisted session history is served by `AgentSessions`
-    /// regardless.
+    /// True when the selected actor supports shared sessions and the host
+    /// successfully listed them through tmux.
     pub available: bool,
     /// Host's tmux version string when `available` is true, empty otherwise.
     pub version: String,
@@ -1614,6 +1628,61 @@ pub struct AgentShareTerminateReq {
 pub struct AgentShareTerminateResult {
     /// Ids of the caller's terminals that were attached to this shared
     /// session; the client removes them locally.
+    pub terminal_ids: Vec<String>,
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Custom tmux sessions: non-owned sessions with a registry-detected agent.
+// ---------------------------------------------------------------------------
+
+/// Discover custom tmux sessions on the host's configured tmux server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TmuxSessionListReq {}
+
+/// One non-owned tmux session containing at least one registered agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TmuxSessionSummary {
+    /// Byte-exact tmux session name used for later revalidation.
+    pub name: String,
+    /// Registered actor slugs detected across the session's live panes,
+    /// deduplicated in pane order.
+    pub agent_slugs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TmuxSessionListResult {
+    /// True when tmux was usable, even if no custom sessions were detected.
+    pub available: bool,
+    /// Host's tmux version string when `available` is true, empty otherwise.
+    pub version: String,
+    pub sessions: Vec<TmuxSessionSummary>,
+    pub error: Option<String>,
+}
+
+/// Attach a terminal client to one exact custom tmux session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TmuxSessionAttachReq {
+    pub name: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TmuxSessionAttachResult {
+    pub terminal_id: String,
+    pub error: Option<String>,
+}
+
+/// Terminate one exact custom tmux session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TmuxSessionTerminateReq {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TmuxSessionTerminateResult {
+    /// Ids of this session's terminal clients removed by the host.
     pub terminal_ids: Vec<String>,
     pub error: Option<String>,
 }
@@ -2029,10 +2098,12 @@ mod tests {
 
     #[test]
     fn agent_share_roundtrip() {
-        let list_req = AgentShareListReq { slug: "pi".into() };
-        let encoded = postcard::to_allocvec(&list_req).unwrap();
-        let decoded: AgentShareListReq = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded, list_req);
+        for slug in ["pi", "omp"] {
+            let list_req = AgentShareListReq { slug: slug.into() };
+            let encoded = postcard::to_allocvec(&list_req).unwrap();
+            let decoded: AgentShareListReq = postcard::from_bytes(&encoded).unwrap();
+            assert_eq!(decoded, list_req);
+        }
 
         let result = AgentShareListResult {
             available: true,
@@ -2061,13 +2132,25 @@ mod tests {
         let decoded: AgentShareListResult = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, unavailable);
 
-        let term_req = AgentShareTerminateReq {
-            slug: "pi".into(),
-            session_id: "019e".into(),
+        let unsupported = AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some("agent does not support shared sessions".into()),
         };
-        let encoded = postcard::to_allocvec(&term_req).unwrap();
-        let decoded: AgentShareTerminateReq = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded, term_req);
+        let encoded = postcard::to_allocvec(&unsupported).unwrap();
+        let decoded: AgentShareListResult = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, unsupported);
+
+        for slug in ["pi", "omp"] {
+            let term_req = AgentShareTerminateReq {
+                slug: slug.into(),
+                session_id: "019e".into(),
+            };
+            let encoded = postcard::to_allocvec(&term_req).unwrap();
+            let decoded: AgentShareTerminateReq = postcard::from_bytes(&encoded).unwrap();
+            assert_eq!(decoded, term_req);
+        }
 
         let term_result = AgentShareTerminateResult {
             terminal_ids: vec!["term-1".into(), "term-2".into()],
@@ -2080,17 +2163,105 @@ mod tests {
 
     #[test]
     fn agent_share_enum_variants_roundtrip() {
-        let list = ZedraProto::AgentShareList(AgentShareListReq { slug: "pi".into() });
-        let encoded = postcard::to_allocvec(&list).unwrap();
-        let decoded: ZedraProto = postcard::from_bytes(&encoded).unwrap();
-        assert!(matches!(decoded, ZedraProto::AgentShareList(_)));
+        for slug in ["pi", "omp"] {
+            let list = ZedraProto::AgentShareList(AgentShareListReq { slug: slug.into() });
+            let encoded = postcard::to_allocvec(&list).unwrap();
+            let decoded: ZedraProto = postcard::from_bytes(&encoded).unwrap();
+            assert!(matches!(decoded, ZedraProto::AgentShareList(_)));
 
-        let term = ZedraProto::AgentShareTerminate(AgentShareTerminateReq {
+            let term = ZedraProto::AgentShareTerminate(AgentShareTerminateReq {
+                slug: slug.into(),
+                session_id: "019e".into(),
+            });
+            let encoded = postcard::to_allocvec(&term).unwrap();
+            let decoded: ZedraProto = postcard::from_bytes(&encoded).unwrap();
+            assert!(matches!(decoded, ZedraProto::AgentShareTerminate(_)));
+        }
+    }
+
+    #[test]
+    fn tmux_session_wire_types_roundtrip() {
+        let list_req = TmuxSessionListReq {};
+        let encoded = postcard::to_allocvec(&list_req).unwrap();
+        let decoded: TmuxSessionListReq = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, list_req);
+
+        let list_result = TmuxSessionListResult {
+            available: true,
+            version: "3.3a".into(),
+            sessions: vec![TmuxSessionSummary {
+                name: "cars us;$(touch nope)".into(),
+                agent_slugs: vec!["pi".into(), "claude".into()],
+            }],
+            error: None,
+        };
+        let encoded = postcard::to_allocvec(&list_result).unwrap();
+        let decoded: TmuxSessionListResult = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, list_result);
+
+        let attach_req = TmuxSessionAttachReq {
+            name: "cars us;$(touch nope)".into(),
+            cols: 120,
+            rows: 40,
+        };
+        let encoded = postcard::to_allocvec(&attach_req).unwrap();
+        let decoded: TmuxSessionAttachReq = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, attach_req);
+
+        let attach_result = TmuxSessionAttachResult {
+            terminal_id: "term-1".into(),
+            error: None,
+        };
+        let encoded = postcard::to_allocvec(&attach_result).unwrap();
+        let decoded: TmuxSessionAttachResult = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, attach_result);
+
+        let terminate_req = TmuxSessionTerminateReq {
+            name: "cars us;$(touch nope)".into(),
+        };
+        let encoded = postcard::to_allocvec(&terminate_req).unwrap();
+        let decoded: TmuxSessionTerminateReq = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, terminate_req);
+
+        let terminate_result = TmuxSessionTerminateResult {
+            terminal_ids: vec!["term-1".into(), "term-2".into()],
+            error: None,
+        };
+        let encoded = postcard::to_allocvec(&terminate_result).unwrap();
+        let decoded: TmuxSessionTerminateResult = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, terminate_result);
+    }
+
+    #[test]
+    fn tmux_session_variants_are_appended_in_wire_order() {
+        let existing_tail = ZedraProto::AgentShareTerminate(AgentShareTerminateReq {
             slug: "pi".into(),
             session_id: "019e".into(),
         });
-        let encoded = postcard::to_allocvec(&term).unwrap();
+        assert_eq!(postcard::to_allocvec(&existing_tail).unwrap()[0], 55);
+
+        let list = ZedraProto::TmuxSessionList(TmuxSessionListReq {});
+        let encoded = postcard::to_allocvec(&list).unwrap();
+        assert_eq!(encoded[0], 56);
         let decoded: ZedraProto = postcard::from_bytes(&encoded).unwrap();
-        assert!(matches!(decoded, ZedraProto::AgentShareTerminate(_)));
+        assert!(matches!(decoded, ZedraProto::TmuxSessionList(_)));
+
+        let attach = ZedraProto::TmuxSessionAttach(TmuxSessionAttachReq {
+            name: "cars_us".into(),
+            cols: 120,
+            rows: 40,
+        });
+        let encoded = postcard::to_allocvec(&attach).unwrap();
+        assert_eq!(encoded[0], 57);
+        let decoded: ZedraProto = postcard::from_bytes(&encoded).unwrap();
+        assert!(matches!(decoded, ZedraProto::TmuxSessionAttach(_)));
+
+        let terminate = ZedraProto::TmuxSessionTerminate(TmuxSessionTerminateReq {
+            name: "cars_us".into(),
+        });
+        let encoded = postcard::to_allocvec(&terminate).unwrap();
+        assert_eq!(encoded[0], 58);
+        let decoded: ZedraProto = postcard::from_bytes(&encoded).unwrap();
+        assert!(matches!(decoded, ZedraProto::TmuxSessionTerminate(_)));
     }
 }

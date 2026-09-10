@@ -82,52 +82,75 @@ managed agents override `default_launch_command` (and put the flag in
 
 ### Shared sessions (tmux)
 
-Pi can resume a session inside a host-owned tmux session, so terminal clients
-besides Zedra attach to the same pane. Only Pi has this capability today:
-`AgentActor::supports_shared_sessions()` gates it, and the RPC and resume paths
-key on that flag — never on the `pi` slug.
+Pi and OMP can resume a session inside a host-owned tmux session, so terminal
+clients besides Zedra can attach to the same pane. Both actors opt in by
+returning `true` from `AgentActor::supports_shared_sessions()`. The RPC and
+resume paths gate on that capability and the registered actor slug, not on a
+hardcoded agent list.
 
-Zedra owns the tmux namespace `zedra-pi-<hex(session_id)>` in
-`crates/zedra-host/src/tmux.rs`. The codec hex-encodes the Pi session ID, is
-reversible and collision-free, and doubles as a safe tmux target: the host only
-lists and terminates names produced by this codec, so foreign or malformed
-tmux sessions stay untracked. Resuming a known session ID runs the actor's
-`resume_launch_command` as the tmux inner command — the actor stays the
-authority for what to launch; tmux owns only the PTY.
+Zedra owns the tmux namespace `zedra-<slug>-<hex(session_id)>` in
+`crates/zedra-host/src/tmux.rs`. Slugs match
+`[a-z0-9]+(?:-[a-z0-9]+)*`. The codec hex-encodes the UTF-8 session ID and is
+reversible and collision-free. The owned shared-session path lists and
+terminates only names produced by this codec and filters them by the requested
+slug. Pi targets remain `zedra-pi-<hex(session_id)>`; OMP targets are
+`zedra-omp-<hex(session_id)>`. Every `zedra-*` name is reserved, so malformed
+names in that namespace are neither treated as owned sessions nor exposed as
+custom sessions.
+
+Foreign tmux sessions remain non-owned. Through a separate custom-tmux
+capability, the host can discover a foreign session when at least one live pane
+is identified as a registered actor, attach a normal Zedra terminal client to
+its exact name, and explicitly terminate it. This detection is informational:
+it does not turn the session into a Zedra-owned shared session, decode or invent
+a provider session ID, or add it to Pi or OMP history. Custom sessions appear in
+a separate `Tmux sessions` section alongside, but structurally outside, agent
+history.
+
+Resuming a known session ID runs the actor's `resume_launch_command` as the tmux
+inner command. By default, Pi produces `pi --session {quoted}` and OMP produces
+the exact `omp --resume {quoted}` command, where `{quoted}` is the shell-quoted
+session ID. User `resume_cmd` overrides remain actor-owned. tmux owns only the
+PTY.
 
 Capability and errors:
 
 - The host discovers `tmux` on PATH and requires tmux 3.3a or newer. A missing
-  or too-old tmux fails every resume of a known Pi session with an actionable
-  error before a terminal is created. There is no direct-resume fallback.
+  or too-old tmux fails every known-session resume for a shared-capable actor
+  with an actionable error before a terminal is created. There is no
+  direct-resume fallback.
 - Without `tmux.socket`, tmux uses its standard socket, usually under `/tmp`.
   Set an absolute persistent path in the global config when sessions must
   survive a container restart. The key is global-only because it selects the
-  server on which Zedra lists and terminates owned sessions. Every SSH or
-  manual tmux client must select the same socket.
-- A fresh Pi launch whose session ID is not known before spawn stays a direct
-  PTY child. Only known-ID resumes go through tmux.
-- `AgentShareList` reports `available: false` with the exact reason when tmux
-  is unusable; persisted session history keeps working. See
-  `docs/PROTOCOL_SPECS.md` §5.8.
+  server on which Zedra manages owned sessions and discovers or manages eligible
+  custom sessions. Every SSH or manual tmux client must select the same socket.
+- A fresh Pi or OMP launch whose session ID is not known before spawn stays a
+  direct PTY child. Only known-ID resumes go through tmux.
+- `AgentShareList` distinguishes actor support from tmux availability.
+  Unsupported actors skip shared-session polling. Pi and OMP with unusable tmux
+  report the exact availability error while persisted session history keeps
+  working. See `docs/PROTOCOL_SPECS.md` §5.8.
+- Restarting `zedra-host` leaves the tmux server and its sessions running. A
+  later poll or resume re-discovers the matching slug and session ID.
 
 Close versus terminate:
 
 - Closing a terminal card detaches only that tmux client. The tmux session and
-  the Pi process keep running, and other clients keep their pane.
-- Terminate (long-press, destructive confirm) kills the tmux session: the Pi
-  process stops and every attached terminal exits. Plain terminals are never
-  affected.
+  agent process keep running, and other clients keep their pane.
+- Terminate (long-press, destructive confirm) kills the tmux session: the agent
+  process stops and every attached terminal exits. Other agent sessions and
+  plain terminals are never affected.
 
 Limitations:
 
-- Zedra scrollback starts at attachment time. Older output is reachable
-  through tmux copy mode (prefix + `[`), not replayed into the Zedra card.
+- Zedra scrollback starts at attachment time. Older output is reachable through
+  tmux copy mode (prefix + `[`), not replayed into the Zedra card.
 - `window-size largest` sizes the pane from the largest attached interactive
   client, maximizing width and height independently: a 120x40 desktop beside a
   38x100 phone yields a 120x99 pane. The desktop scrolls rows it cannot show.
 - tmux sanitizes metadata output, so pane title and cwd are display-only and
-  lossy for non-ASCII bytes. Pi session IDs never pass through tmux output.
+  lossy for non-ASCII bytes. Agent session IDs are decoded from owned target
+  names and never pass through pane metadata.
 
 ### CLI wrappers
 

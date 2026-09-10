@@ -1,8 +1,8 @@
 // Tmux session identities, pure output parsers, and the concrete subprocess
-// client for Zedra-owned sessions. Production discovers `tmux` on PATH; the
-// ignored lifecycle tests (`test(host): cover tmux session lifecycle`) inject
-// a binary path and a private `-L` socket instead.
+// client for Zedra-owned and conservatively detected non-owned sessions.
+// Production discovers `tmux` on PATH; tests can inject a private server.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use data_encoding::HEXLOWER;
 use crate::agent::utils::{command_output_with_timeout, shell_quote};
 
 /// Namespace prefix for tmux sessions created and terminated by Zedra.
-pub const OWNED_SESSION_PREFIX: &str = "zedra-pi-";
+pub const OWNED_SESSION_PREFIX: &str = "zedra-";
 
 /// Proven `list-panes` format for process fields: exactly 4 `|`-separated fields.
 pub const PROCESS_PANE_FORMAT: &str =
@@ -23,42 +23,65 @@ pub const PROCESS_PANE_FORMAT: &str =
 pub const METADATA_PANE_FORMAT: &str =
     "#{pane_id}|#{pane_title}|#{pane_current_path}|#{pane_start_command}";
 
-/// Encode a Pi session ID into the owned tmux session name.
-pub fn owned_session_name(session_id: &str) -> Result<String> {
-    ensure!(!session_id.is_empty(), "empty Pi session id");
+/// Encode an agent/session identity into its owned tmux session name.
+pub fn owned_session_name(slug: &str, session_id: &str) -> Result<String> {
+    validate_slug(slug)?;
+    ensure!(!session_id.is_empty(), "empty agent session id");
     Ok(format!(
-        "{OWNED_SESSION_PREFIX}{}",
+        "{OWNED_SESSION_PREFIX}{slug}-{}",
         HEXLOWER.encode(session_id.as_bytes())
     ))
 }
 
-/// Decode an owned session name back to its Pi session ID.
-/// Every foreign or malformed name is untracked and yields `None`.
-pub fn session_id_from_name(name: &str) -> Option<String> {
-    let encoded = name.strip_prefix(OWNED_SESSION_PREFIX)?;
-    if encoded.is_empty() {
-        return None;
-    }
-    let bytes = HEXLOWER.decode(encoded.as_bytes()).ok()?;
-    let session_id = String::from_utf8(bytes).ok()?;
-    if session_id.is_empty() {
-        return None;
-    }
-    Some(session_id)
+fn validate_slug(slug: &str) -> Result<()> {
+    ensure!(
+        !slug.is_empty()
+            && slug.split('-').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            }),
+        "invalid agent slug: {slug:?}"
+    );
+    Ok(())
 }
 
 /// Whether a tmux session name belongs to Zedra's owned namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOwnership {
-    Owned { session_id: String },
+    Owned { slug: String, session_id: String },
     Untracked,
 }
 
-/// Classify a tmux session name; a valid owned name wins over every foreign one.
+/// Classify a tmux session name; every foreign or malformed name is untracked.
 pub fn session_ownership(name: &str) -> SessionOwnership {
-    match session_id_from_name(name) {
-        Some(session_id) => SessionOwnership::Owned { session_id },
-        None => SessionOwnership::Untracked,
+    let Some((slug, encoded)) = name
+        .strip_prefix(OWNED_SESSION_PREFIX)
+        .and_then(|rest| rest.rsplit_once('-'))
+    else {
+        return SessionOwnership::Untracked;
+    };
+    if validate_slug(slug).is_err()
+        || encoded.is_empty()
+        || encoded.len() % 2 != 0
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return SessionOwnership::Untracked;
+    }
+    let Some(session_id) = HEXLOWER
+        .decode(encoded.as_bytes())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return SessionOwnership::Untracked;
+    };
+    SessionOwnership::Owned {
+        slug: slug.to_string(),
+        session_id,
     }
 }
 
@@ -203,13 +226,22 @@ pub fn parse_pane_metadata(line: &str) -> Result<PaneMetadata> {
 /// One Zedra-owned session's live pane state, from [`TmuxClient::list_sessions`].
 #[derive(Debug, Clone)]
 pub struct OwnedPane {
+    pub slug: String,
     pub session_id: String,
     pub process: PaneProcess,
     pub metadata: PaneMetadata,
 }
 
+/// A non-owned tmux session containing at least one registered agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DetectedTmuxSession {
+    pub name: String,
+    pub agent_slugs: Vec<String>,
+    pub identity_command: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
-// Subprocess client: concrete tmux operations on Zedra-owned sessions
+// Subprocess client: concrete tmux operations on the selected server
 // ---------------------------------------------------------------------------
 
 /// Subprocess deadline for every tmux client call; tmux calls are local and
@@ -342,7 +374,7 @@ impl TmuxClient {
         self.text(&output, what)
     }
 
-    /// Prepare or attach to the owned session for `session_id`.
+    /// Prepare or attach to the owned session for `(slug, session_id)`.
     ///
     /// Runs `new-session -d -A` headless: an existing target ignores the inner
     /// command, so concurrent prepares start exactly one inner process. Sets
@@ -350,11 +382,12 @@ impl TmuxClient {
     /// Returns the command a terminal should run to attach.
     pub fn prepare_session(
         &self,
+        slug: &str,
         session_id: &str,
         workdir: &Path,
         resume_command: &str,
     ) -> Result<String> {
-        let name = owned_session_name(session_id)?;
+        let name = owned_session_name(slug, session_id)?;
         let workdir = workdir.to_str().context("workdir is not UTF-8")?;
         let args = [
             "new-session",
@@ -398,20 +431,24 @@ impl TmuxClient {
         Ok(self.attach_command(&name))
     }
 
-    /// List the Zedra-owned sessions on this socket with their first pane's
-    /// process and metadata state. Foreign and malformed sessions are untracked
-    /// and omitted; an owned session whose pane data cannot be read is skipped
-    /// rather than poisoning the whole listing.
-    pub fn list_sessions(&self) -> Result<Vec<OwnedPane>> {
+    /// List one agent's Zedra-owned sessions on this socket with their first
+    /// pane's process and metadata state. Other agent namespaces, foreign
+    /// sessions, and malformed sessions are skipped before pane inspection; an
+    /// owned session whose pane data cannot be read is also skipped.
+    pub fn list_sessions(&self, requested_slug: &str) -> Result<Vec<OwnedPane>> {
+        validate_slug(requested_slug)?;
         let Some(session_text) = self.list_session_names()? else {
             return Ok(Vec::new());
         };
         let mut sessions = Vec::new();
         for name in session_text.lines() {
             let name = name.trim();
-            let SessionOwnership::Owned { session_id } = session_ownership(name) else {
+            let SessionOwnership::Owned { slug, session_id } = session_ownership(name) else {
                 continue;
             };
+            if slug != requested_slug {
+                continue;
+            }
             let Ok(process_text) = self.run_ok(
                 &["list-panes", "-t", name, "-F", PROCESS_PANE_FORMAT],
                 "list panes",
@@ -437,12 +474,210 @@ impl TmuxClient {
                 continue;
             };
             sessions.push(OwnedPane {
+                slug,
                 session_id,
                 process,
                 metadata,
             });
         }
         Ok(sessions)
+    }
+
+    /// List non-owned sessions whose live panes identify a registered agent.
+    pub(crate) fn list_detected_sessions(&self) -> Result<Vec<DetectedTmuxSession>> {
+        let Some(session_text) = self.list_session_names()? else {
+            return Ok(Vec::new());
+        };
+        let mut sessions = Vec::new();
+        for name in session_text.lines() {
+            if name.starts_with(OWNED_SESSION_PREFIX) {
+                continue;
+            }
+            if let Ok(Some(session)) = self.detect_session(name) {
+                sessions.push(session);
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Revalidate a detected session and return its exact attach command.
+    pub fn prepare_detected_attach(&self, name: &str) -> Result<(String, Option<String>)> {
+        self.validate_detected_name(name)?;
+        ensure!(
+            self.session_exists(name)?,
+            "tmux session {name:?} no longer exists"
+        );
+        let session = match self.detect_session(name) {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                ensure!(
+                    self.session_exists(name)?,
+                    "tmux session {name:?} no longer exists"
+                );
+                bail!("tmux session {name:?} no longer contains a detected agent")
+            }
+            Err(error) => {
+                ensure!(
+                    self.session_exists(name)?,
+                    "tmux session {name:?} no longer exists"
+                );
+                return Err(error);
+            }
+        };
+        let target = format!("={}", session.name);
+        Ok((
+            self.attach_command_with_shell_target(&shell_quote_always(&target)),
+            session.identity_command,
+        ))
+    }
+
+    /// Revalidate and terminate one exact non-owned detected session.
+    pub fn terminate_detected_session(&self, name: &str) -> Result<()> {
+        self.validate_detected_name(name)?;
+        if !self.session_exists(name)? {
+            return Ok(());
+        }
+        match self.detect_session(name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if !self.session_exists(name)? {
+                    return Ok(());
+                }
+                bail!("tmux session {name:?} no longer contains a detected agent")
+            }
+            Err(error) => {
+                if !self.session_exists(name)? {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        }
+        let target = format!("={name}");
+        let output = self.run(
+            &["kill-session", "-t", &target],
+            "terminate the detected session",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            ensure!(
+                stderr.contains("can't find session:") || Self::is_no_server(&stderr),
+                "tmux terminate the detected session failed with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_detected_name(&self, name: &str) -> Result<()> {
+        ensure!(!name.is_empty(), "empty tmux session name");
+        ensure!(
+            !name.starts_with(OWNED_SESSION_PREFIX),
+            "tmux session names beginning with {OWNED_SESSION_PREFIX:?} are reserved"
+        );
+        Ok(())
+    }
+
+    fn session_exists(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .list_session_names()?
+            .is_some_and(|session_text| session_text.lines().any(|candidate| candidate == name)))
+    }
+
+    fn detect_session(&self, name: &str) -> Result<Option<DetectedTmuxSession>> {
+        let target = format!("={name}");
+        let process_text = self.run_ok(
+            &["list-panes", "-s", "-t", &target, "-F", PROCESS_PANE_FORMAT],
+            "list detected session panes",
+        )?;
+        let metadata_text = self.run_ok(
+            &[
+                "list-panes",
+                "-s",
+                "-t",
+                &target,
+                "-F",
+                METADATA_PANE_FORMAT,
+            ],
+            "list detected session panes",
+        )?;
+
+        let processes = process_text
+            .lines()
+            .map(parse_pane_process)
+            .collect::<Result<Vec<_>>>()?;
+        let metadata = metadata_text
+            .lines()
+            .map(parse_pane_metadata)
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            processes.len() == metadata.len(),
+            "tmux pane process and metadata counts differ"
+        );
+
+        let mut process_ids = HashSet::with_capacity(processes.len());
+        ensure!(
+            processes
+                .iter()
+                .all(|process| process_ids.insert(process.pane_id.as_str())),
+            "tmux pane process records contain duplicate ids"
+        );
+        let mut metadata_by_id = HashMap::with_capacity(metadata.len());
+        for pane in &metadata {
+            ensure!(
+                metadata_by_id.insert(pane.pane_id.as_str(), pane).is_none(),
+                "tmux pane metadata records contain duplicate ids"
+            );
+        }
+        ensure!(
+            processes
+                .iter()
+                .all(|process| metadata_by_id.contains_key(process.pane_id.as_str())),
+            "tmux pane process and metadata ids differ"
+        );
+
+        let mut agent_slugs = Vec::new();
+        let mut identity_command = None;
+        for process in processes {
+            if process.dead {
+                continue;
+            }
+            let pane_metadata = metadata_by_id
+                .get(process.pane_id.as_str())
+                .context("tmux pane metadata disappeared while pairing records")?;
+            let current_command = process.current_command.trim();
+            let detected = (!current_command.is_empty())
+                .then(|| crate::agent::detect::detect_command(current_command))
+                .flatten()
+                .map(|slug| (slug, current_command));
+            let detected = detected.or_else(|| {
+                let start_command = pane_metadata.start_command.trim();
+                (!start_command.is_empty())
+                    .then(|| crate::agent::detect::detect_command(start_command))
+                    .flatten()
+                    .map(|slug| (slug, start_command))
+            });
+            let Some((slug, command)) = detected else {
+                continue;
+            };
+            if !agent_slugs.iter().any(|known| known == slug) {
+                agent_slugs.push(slug.to_string());
+            }
+            if identity_command.is_none() {
+                identity_command = Some(command.to_string());
+            }
+        }
+        if agent_slugs.is_empty() {
+            return Ok(None);
+        }
+        if agent_slugs.len() != 1 {
+            identity_command = None;
+        }
+        Ok(Some(DetectedTmuxSession {
+            name: name.to_string(),
+            agent_slugs,
+            identity_command,
+        }))
     }
 
     /// The no-server case is the documented "available capability, empty list"
@@ -476,16 +711,11 @@ impl TmuxClient {
 
     /// Terminate the owned session rebuilt from `(slug, session_id)`.
     ///
-    /// Accepts only the owning slug and an owned-namespace target derived by
-    /// the codec — never a raw tmux name. An already-vanished session counts
-    /// as terminated.
+    /// Accepts only an owned-namespace target derived by the codec — never a
+    /// raw tmux name. The RPC layer validates actor capability. An
+    /// already-vanished session counts as terminated.
     pub fn terminate_session(&self, slug: &str, session_id: &str) -> Result<()> {
-        // The `zedra-pi-` prefix is Pi's namespace; another agent needs its own.
-        ensure!(
-            slug == "pi",
-            "agent {slug:?} does not own shared tmux sessions"
-        );
-        let name = owned_session_name(session_id)?;
+        let name = owned_session_name(slug, session_id)?;
         let output = self.run(
             &["kill-session", "-t", &name],
             "terminate the shared session",
@@ -503,9 +733,13 @@ impl TmuxClient {
     }
 
     /// The command a terminal runs to attach: exec tmux, select the configured
-    /// server, attach the owned target, and exit with tmux's status so a failed
-    /// attach does not leave a login shell behind.
+    /// server, attach the supplied target, and exit with tmux's status so a
+    /// failed attach does not leave a login shell behind.
     pub fn attach_command(&self, name: &str) -> String {
+        self.attach_command_with_shell_target(&shell_quote(name))
+    }
+
+    fn attach_command_with_shell_target(&self, target: &str) -> String {
         let binary = shell_quote(&self.binary.to_string_lossy());
         let socket = match &self.socket {
             TmuxSocket::Default => String::new(),
@@ -514,11 +748,12 @@ impl TmuxClient {
                 format!("-S {} ", shell_quote(&path.to_string_lossy()))
             }
         };
-        format!(
-            "exec {binary} {socket}attach-session -t {} || exit $?",
-            shell_quote(name)
-        )
+        format!("exec {binary} {socket}attach-session -t {target} || exit $?")
     }
+}
+
+fn shell_quote_always(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -528,45 +763,62 @@ mod tests {
     const UUID: &str = "3f9d3b52-6a1d-4c4f-9a2b-8f0e5d1c7a10";
 
     #[test]
-    fn owned_names_round_trip_arbitrary_ids() {
-        for id in [
-            UUID,
-            "with space",
-            "with\ttab",
-            "quote'and\"double",
-            "shell;$meta|chars&`",
-            "ünïcödé-セッション-🚀",
-            "0",
-        ] {
-            let name = owned_session_name(id).unwrap();
-            assert!(name.starts_with(OWNED_SESSION_PREFIX));
-            let payload = &name[OWNED_SESSION_PREFIX.len()..];
-            assert!(!payload.is_empty());
-            assert!(
-                payload
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-                "payload: {payload}"
-            );
-            assert_eq!(session_id_from_name(&name).as_deref(), Some(id));
+    fn owned_names_round_trip_agent_and_arbitrary_session_ids() {
+        for slug in ["pi", "omp", "agent-with-hyphen"] {
+            for id in [
+                UUID,
+                "with space",
+                "with\ttab",
+                "quote'and\"double",
+                "shell;$meta|chars&`",
+                "ünïcödé-セッション-🚀",
+                "0",
+            ] {
+                let name = owned_session_name(slug, id).unwrap();
+                let SessionOwnership::Owned {
+                    slug: decoded_slug,
+                    session_id,
+                } = session_ownership(&name)
+                else {
+                    panic!("owned name must decode: {name}");
+                };
+                assert_eq!(decoded_slug, slug);
+                assert_eq!(session_id, id);
+                assert_eq!(
+                    owned_session_name(&decoded_slug, &session_id).unwrap(),
+                    name
+                );
+            }
         }
+        assert_eq!(
+            owned_session_name("pi", "session-1").unwrap(),
+            "zedra-pi-73657373696f6e2d31"
+        );
+        assert_eq!(
+            owned_session_name("omp", "session-1").unwrap(),
+            "zedra-omp-73657373696f6e2d31"
+        );
     }
 
     #[test]
-    fn owned_names_reject_empty_ids() {
-        assert!(owned_session_name("").is_err());
-        assert_eq!(session_id_from_name(OWNED_SESSION_PREFIX), None);
+    fn owned_names_reject_invalid_slugs_and_empty_ids() {
+        for slug in ["", "-pi", "pi-", "pi--omp", "Pi", "pi_omp", "π"] {
+            assert!(owned_session_name(slug, UUID).is_err(), "slug: {slug:?}");
+        }
+        assert!(owned_session_name("pi", "").is_err());
     }
 
     #[test]
-    fn owned_names_are_collision_free_and_stable() {
-        let encoded = ["ab", "abc", "ba"].map(|id| owned_session_name(id).unwrap());
-        assert_ne!(encoded[0], encoded[1]);
-        assert_ne!(encoded[0], encoded[2]);
-        let id = "ünïcödé";
-        let name = owned_session_name(id).unwrap();
-        let decoded = session_id_from_name(&name).unwrap();
-        assert_eq!(owned_session_name(&decoded).unwrap(), name);
+    fn owned_names_are_collision_free() {
+        let encoded = [
+            owned_session_name("pi", "ab").unwrap(),
+            owned_session_name("pi", "abc").unwrap(),
+            owned_session_name("pi", "ba").unwrap(),
+            owned_session_name("omp", "ab").unwrap(),
+        ];
+        for (index, name) in encoded.iter().enumerate() {
+            assert!(!encoded[index + 1..].contains(name));
+        }
     }
 
     #[test]
@@ -574,29 +826,35 @@ mod tests {
         for name in [
             "main",
             "zsh-0",
+            "zedra",
             "zedra-pi",
+            "zedra--61",
+            "zedra--pi-61",
+            "zedra-pi--61",
+            "zedra-Pi-61",
+            "zedra-pi_omp-61",
             "zedra-π-aaaa",
             " zedra-pi-61",
             "zedra-pi-61 ",
-            "zedra-pi-",     // empty payload
-            "zedra-pi-abc",  // odd length
-            "zedra-pi-zzzz", // not hex
-            "zedra-pi-ABCD", // uppercase hex
-            "zedra-pi-ff",   // invalid UTF-8
-            "zedra-pi-6 1",  // non-hex byte
+            "zedra-pi-",
+            "zedra-pi-abc",
+            "zedra-pi-zzzz",
+            "zedra-pi-ABCD",
+            "zedra-pi-ff",
+            "zedra-pi-6 1",
         ] {
-            assert_eq!(session_id_from_name(name), None, "name: {name:?}");
             assert_eq!(session_ownership(name), SessionOwnership::Untracked);
         }
     }
 
     #[test]
-    fn ownership_precedence_favors_valid_owned_names() {
-        let name = owned_session_name(UUID).unwrap();
+    fn ownership_decodes_slug_and_session_id() {
+        let name = owned_session_name("agent-with-hyphen", UUID).unwrap();
         assert_eq!(
             session_ownership(&name),
             SessionOwnership::Owned {
-                session_id: UUID.to_string()
+                slug: "agent-with-hyphen".to_string(),
+                session_id: UUID.to_string(),
             }
         );
     }
@@ -795,7 +1053,7 @@ mod tests {
             "-d",
             "-A",
             "-s",
-            &owned_session_name("session-1").unwrap(),
+            &owned_session_name("pi", "session-1").unwrap(),
             "-c",
             "/tmp/proof/workdir",
             "pi resume abc",
@@ -909,50 +1167,69 @@ mod tests {
 
     #[test]
     fn list_sessions_skips_foreign_and_malformed_names() {
-        // Pure classification re-check over mixed names: owned names survive,
-        // foreign and malformed names never reach pane listing.
         let names = [
             "zedra-pi-73657373696f6e",
+            "zedra-omp-73657373696f6e",
             "main",
             "zedra-pi-",
             "ZEDRA-PI-73657373696F6E",
             "zedra-pi-zzz",
         ];
-        let owned: Vec<&str> = names
+        let owned: Vec<(&str, &str)> = names
             .iter()
-            .filter(|name| matches!(session_ownership(name), SessionOwnership::Owned { .. }))
-            .copied()
+            .filter_map(|name| match session_ownership(name) {
+                SessionOwnership::Owned { slug, .. } => Some((
+                    *name,
+                    match slug.as_str() {
+                        "pi" => "pi",
+                        "omp" => "omp",
+                        _ => unreachable!(),
+                    },
+                )),
+                SessionOwnership::Untracked => None,
+            })
             .collect();
-        assert_eq!(owned, ["zedra-pi-73657373696f6e"]);
+        assert_eq!(
+            owned,
+            [
+                ("zedra-pi-73657373696f6e", "pi"),
+                ("zedra-omp-73657373696f6e", "omp"),
+            ]
+        );
     }
 
     #[test]
-    fn prepare_session_rejects_empty_session_ids_before_spawn() {
+    fn tmux_operations_reject_invalid_identity_before_spawn() {
         let client = TmuxClient {
-            binary: PathBuf::from("/usr/bin/tmux"),
+            binary: PathBuf::from("/nonexistent/tmux-for-zedra-test"),
             socket: TmuxSocket::Default,
             version: min_supported_version(),
         };
-        let error = client
-            .prepare_session("", Path::new("/tmp/workdir"), "pi resume x")
-            .unwrap_err();
-        assert!(error.to_string().contains("empty Pi session id"));
-    }
-
-    #[test]
-    fn terminate_session_refuses_foreign_slugs_and_empty_ids() {
-        let client = TmuxClient {
-            binary: PathBuf::from("/usr/bin/tmux"),
-            socket: TmuxSocket::Default,
-            version: min_supported_version(),
-        };
-        let error = client.terminate_session("claude", UUID).unwrap_err();
-        assert!(error
+        assert!(client
+            .prepare_session("Pi", UUID, Path::new("/tmp/workdir"), "pi resume x")
+            .unwrap_err()
             .to_string()
-            .contains("does not own shared tmux sessions"));
-
-        let error = client.terminate_session("pi", "").unwrap_err();
-        assert!(error.to_string().contains("empty Pi session id"));
+            .contains("invalid agent slug"));
+        assert!(client
+            .prepare_session("pi", "", Path::new("/tmp/workdir"), "pi resume x")
+            .unwrap_err()
+            .to_string()
+            .contains("empty agent session id"));
+        assert!(client
+            .list_sessions("pi--omp")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid agent slug"));
+        assert!(client
+            .terminate_session("-pi", UUID)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid agent slug"));
+        assert!(client
+            .terminate_session("omp", "")
+            .unwrap_err()
+            .to_string()
+            .contains("empty agent session id"));
     }
 
     #[test]
@@ -964,7 +1241,7 @@ mod tests {
             socket: TmuxSocket::Name("definitely-missing-socket".to_string()),
             version: min_supported_version(),
         };
-        let error = binaryless.list_sessions().unwrap_err();
+        let error = binaryless.list_sessions("pi").unwrap_err();
         assert!(
             error.to_string().contains("list sessions"),
             "unexpected error: {error:#}"
@@ -993,6 +1270,28 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_filters_slug_before_pane_calls() {
+        let pi_name = owned_session_name("pi", "same-id").unwrap();
+        let omp_name = owned_session_name("omp", "same-id").unwrap();
+        let script = format!(
+            "#!/bin/sh\ncase \"$3\" in\n-V) echo 'tmux 3.5' ;;\nlist-sessions) printf '%s\\n' '{pi_name}' '{omp_name}' ;;\nlist-panes)\n  if [ \"$5\" = '{omp_name}' ]; then : > \"$0.marker\"; exit 1; fi\n  case \"$7\" in\n    *pane_current_command*) echo '%1|sh|0|' ;;\n    *) echo '%1|title|/tmp|sh' ;;\n  esac\n  ;;\nesac\nexit 0\n"
+        );
+        let stub = stub_tmux("slug-filter", &script);
+        let marker = PathBuf::from(format!("{}.marker", stub.to_string_lossy()));
+        let client = TmuxClient::with_socket(&stub, Some("stub")).expect("stub probes -V");
+        let panes = client.list_sessions("pi").expect("list Pi sessions");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].slug, "pi");
+        assert_eq!(panes[0].session_id, "same-id");
+        assert!(
+            !marker.exists(),
+            "another agent namespace reached list-panes"
+        );
+        let _ = std::fs::remove_file(&stub);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
     fn prepare_session_accepts_already_prepared_session() {
         // The proven already-prepared answer (rc 1 + "not a terminal") must
         // succeed; the retry sees the same answer and would fail the prepare.
@@ -1003,7 +1302,7 @@ mod tests {
         let binary = stub.clone();
         let client = TmuxClient::with_socket(&binary, Some("stub")).expect("stub probes -V");
         let attach = client
-            .prepare_session(UUID, Path::new("/tmp/workdir"), "pi resume")
+            .prepare_session("pi", UUID, Path::new("/tmp/workdir"), "pi resume")
             .expect("already-prepared prepare must succeed");
         assert!(attach.contains("attach-session -t zedra-pi-"));
         let _ = std::fs::remove_file(&stub);
@@ -1023,6 +1322,367 @@ mod tests {
         client
             .terminate_session("pi", UUID)
             .expect("no-server terminate must count as already terminated");
+        let _ = std::fs::remove_file(&stub);
+    }
+
+    #[test]
+    fn detected_sessions_scan_all_live_panes_and_exclude_reserved_names() {
+        let script = "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) printf '%s\n' 'cars_us' 'single' 'shell-only' 'zedra-malformed' 'zedra-pi-61' 'bad-query' 'bad-record' ;;
+list-panes)
+  case \"$6\" in '=zedra-'*) : > \"$0.reserved\"; exit 1 ;; esac
+  if [ \"$6\" = '=bad-query' ]; then echo 'pane query failed' >&2; exit 9; fi
+  case \"$6:$8\" in
+    '=cars_us:'*pane_current_command*) printf '%s\n' '%1|pi|0|' '%2|sh|0|' '%3|claude|1|0' '%4|pi|0|' ;;
+    '=cars_us:'*) printf '%s\n' '%2|two|/tmp|omp --resume session' '%1|one|/tmp|sh' '%4|four|/tmp|sh' '%3|dead|/tmp|claude' ;;
+    '=single:'*pane_current_command*) printf '%s\n' '%5|sh|0|' '%6|claude|0|' ;;
+    '=single:'*) printf '%s\n' '%5|five|/tmp|claude --continue' '%6|six|/tmp|omp --resume ignored' ;;
+    '=shell-only:'*pane_current_command*) echo '%7|zsh|0|' ;;
+    '=shell-only:'*) echo '%7|shell|/tmp|zsh' ;;
+    '=bad-record:'*pane_current_command*) echo '%8|pi|0|' ;;
+    '=bad-record:'*) echo '%9|bad|/tmp|pi' ;;
+  esac
+  ;;
+esac
+exit 0
+";
+        let stub = stub_tmux("detected-list", script);
+        let marker = PathBuf::from(format!("{}.reserved", stub.to_string_lossy()));
+        let client = TmuxClient::with_socket(&stub, Some("stub")).expect("stub probes -V");
+
+        let sessions = client
+            .list_detected_sessions()
+            .expect("detected session listing");
+        assert_eq!(
+            sessions,
+            [
+                DetectedTmuxSession {
+                    name: "cars_us".to_string(),
+                    agent_slugs: vec!["pi".to_string(), "omp".to_string()],
+                    identity_command: None,
+                },
+                DetectedTmuxSession {
+                    name: "single".to_string(),
+                    agent_slugs: vec!["claude".to_string()],
+                    identity_command: Some("claude --continue".to_string()),
+                },
+            ]
+        );
+        assert!(!marker.exists(), "reserved namespace reached list-panes");
+
+        let _ = std::fs::remove_file(&stub);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn detected_attach_always_quotes_simple_exact_target() {
+        let stub = stub_tmux(
+            "detected-simple-attach",
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) echo 'cars_us' ;;
+list-panes)
+  [ \"$6\" = '=cars_us' ] || exit 7
+  case \"$8\" in
+    *pane_current_command*) echo '%1|pi|0|' ;;
+    *) echo '%1|title|/tmp|sh' ;;
+  esac
+  ;;
+esac
+exit 0
+",
+        );
+        let client = TmuxClient::with_socket(&stub, Some("stub")).expect("stub probes -V");
+
+        let (attach, identity) = client
+            .prepare_detected_attach("cars_us")
+            .expect("prepare simple attach");
+
+        assert_eq!(identity.as_deref(), Some("pi"));
+        assert_eq!(
+            attach,
+            format!(
+                "exec {} -L stub attach-session -t '=cars_us' || exit $?",
+                shell_quote(&stub.to_string_lossy())
+            )
+        );
+
+        let _ = std::fs::remove_file(&stub);
+    }
+
+    #[test]
+    fn detected_attach_and_terminate_use_exact_argv_targets() {
+        let name = "cars us;$HOME'quoted";
+        let script = format!(
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) printf '%s\\n' {name} ;;
+list-panes)
+  [ \"$6\" = {target} ] || exit 7
+  case \"$8\" in
+    *pane_current_command*) echo '%1|pi|0|' ;;
+    *) echo '%1|title|/tmp|sh' ;;
+  esac
+  ;;
+kill-session)
+  [ \"$5\" = {target} ] || exit 8
+  printf '%s' \"$5\" > \"$0.killed\"
+  ;;
+esac
+exit 0
+",
+            name = shell_quote(name),
+            target = shell_quote(&format!("={name}")),
+        );
+        let stub = stub_tmux("detected-exact", &script);
+        let marker = PathBuf::from(format!("{}.killed", stub.to_string_lossy()));
+        let client =
+            TmuxClient::with_socket(&stub, Some("private socket")).expect("stub probes -V");
+
+        let (attach, identity) = client
+            .prepare_detected_attach(name)
+            .expect("prepare exact attach");
+        assert_eq!(identity.as_deref(), Some("pi"));
+        assert_eq!(
+            attach,
+            format!(
+                "exec {} -L 'private socket' attach-session -t '=cars us;$HOME'\\''quoted' || exit $?",
+                shell_quote(&stub.to_string_lossy())
+            )
+        );
+        client
+            .terminate_detected_session(name)
+            .expect("terminate exact target");
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("kill marker"),
+            format!("={name}")
+        );
+
+        let _ = std::fs::remove_file(&stub);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn detected_targets_revalidate_presence_and_agent_identity() {
+        let absent = stub_tmux(
+            "detected-absent",
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) echo 'gone-suffix' ;;
+esac
+exit 0
+",
+        );
+        let client = TmuxClient::with_socket(&absent, Some("stub")).expect("stub probes -V");
+        assert!(client
+            .prepare_detected_attach("gone")
+            .unwrap_err()
+            .to_string()
+            .contains("no longer exists"));
+        client
+            .terminate_detected_session("gone")
+            .expect("disappeared target is terminated");
+
+        let unsupported = stub_tmux(
+            "detected-unsupported",
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) echo 'plain-shell' ;;
+list-panes)
+  case \"$8\" in
+    *pane_current_command*) echo '%1|zsh|0|' ;;
+    *) echo '%1|title|/tmp|zsh' ;;
+  esac
+  ;;
+kill-session) : > \"$0.killed\" ;;
+esac
+exit 0
+",
+        );
+        let marker = PathBuf::from(format!("{}.killed", unsupported.to_string_lossy()));
+        let client = TmuxClient::with_socket(&unsupported, Some("stub")).expect("stub probes -V");
+        for result in [
+            client.prepare_detected_attach("plain-shell").map(|_| ()),
+            client.terminate_detected_session("plain-shell"),
+        ] {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("no longer contains a detected agent"));
+        }
+        assert!(!marker.exists(), "unsupported target reached kill-session");
+        for name in ["", "zedra-pi-61", "zedra-malformed"] {
+            assert!(client.prepare_detected_attach(name).is_err());
+            assert!(client.terminate_detected_session(name).is_err());
+        }
+
+        let _ = std::fs::remove_file(&absent);
+        let _ = std::fs::remove_file(&unsupported);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn detected_listing_treats_no_server_as_empty_and_surfaces_failures() {
+        let no_server = stub_tmux(
+            "detected-no-server",
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions)
+  echo 'no server running on /tmp/tmux-0/stub' >&2
+  exit 1
+  ;;
+esac
+exit 0
+",
+        );
+        let client = TmuxClient::with_socket(&no_server, Some("stub")).expect("stub probes -V");
+        assert_eq!(
+            client.list_detected_sessions().expect("no server is empty"),
+            Vec::new()
+        );
+
+        assert!(client.prepare_detected_attach("gone").is_err());
+        client
+            .terminate_detected_session("gone")
+            .expect("no server means the target is already terminated");
+        let broken = stub_tmux(
+            "detected-broken-server",
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions)
+  echo 'socket corrupted' >&2
+  exit 2
+  ;;
+esac
+exit 0
+",
+        );
+        let client = TmuxClient::with_socket(&broken, Some("stub")).expect("stub probes -V");
+        let error = client.list_detected_sessions().unwrap_err();
+        assert!(
+            error.to_string().contains("socket corrupted"),
+            "unexpected error: {error:#}"
+        );
+
+        let missing = TmuxClient {
+            binary: PathBuf::from("/nonexistent/tmux-for-zedra-detected-test"),
+            socket: TmuxSocket::Default,
+            version: min_supported_version(),
+        };
+        assert!(missing.list_detected_sessions().is_err());
+
+        let _ = std::fs::remove_file(&no_server);
+        let _ = std::fs::remove_file(&broken);
+    }
+
+    #[test]
+    fn detected_targets_handle_disappearance_during_revalidation() {
+        let stub = stub_tmux(
+            "detected-racy",
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) [ -e \"$0.live\" ] && echo 'racy' ;;
+list-panes)
+  rm -f \"$0.live\"
+  echo \"can't find session: racy\" >&2
+  exit 1
+  ;;
+kill-session) : > \"$0.killed\" ;;
+esac
+exit 0
+",
+        );
+        let live = PathBuf::from(format!("{}.live", stub.to_string_lossy()));
+        let killed = PathBuf::from(format!("{}.killed", stub.to_string_lossy()));
+        let client = TmuxClient::with_socket(&stub, Some("stub")).expect("stub probes -V");
+
+        std::fs::write(&live, "").unwrap();
+        let error = client.prepare_detected_attach("racy").unwrap_err();
+        assert!(
+            error.to_string().contains("no longer exists"),
+            "unexpected error: {error:#}"
+        );
+
+        std::fs::write(&live, "").unwrap();
+        client
+            .terminate_detected_session("racy")
+            .expect("disappearance during termination counts as success");
+        assert!(!killed.exists(), "disappeared target reached kill-session");
+
+        let _ = std::fs::remove_file(&stub);
+        let _ = std::fs::remove_file(&live);
+        let _ = std::fs::remove_file(&killed);
+    }
+
+    #[test]
+    fn detected_termination_accepts_disappearance_at_kill() {
+        let stub = stub_tmux(
+            "detected-kill-race",
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) echo 'kill-race' ;;
+list-panes)
+  case \"$8\" in
+    *pane_current_command*) echo '%1|pi|0|' ;;
+    *) echo '%1|title|/tmp|sh' ;;
+  esac
+  ;;
+kill-session)
+  [ \"$5\" = '=kill-race' ] || exit 8
+  echo \"can't find session: kill-race\" >&2
+  exit 1
+  ;;
+esac
+exit 0
+",
+        );
+        let client = TmuxClient::with_socket(&stub, Some("stub")).expect("stub probes -V");
+        client
+            .terminate_detected_session("kill-race")
+            .expect("disappearance at kill counts as success");
+        let _ = std::fs::remove_file(&stub);
+    }
+
+    #[test]
+    fn detected_termination_surfaces_unexpected_kill_failure() {
+        let stub = stub_tmux(
+            "detected-kill-failure",
+            "#!/bin/sh
+case \"$3\" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) echo 'kill-failure' ;;
+list-panes)
+  case \"$8\" in
+    *pane_current_command*) echo '%1|pi|0|' ;;
+    *) echo '%1|title|/tmp|sh' ;;
+  esac
+  ;;
+kill-session)
+  echo 'permission denied' >&2
+  exit 4
+  ;;
+esac
+exit 0
+",
+        );
+        let client = TmuxClient::with_socket(&stub, Some("stub")).expect("stub probes -V");
+        let error = client
+            .terminate_detected_session("kill-failure")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("permission denied"),
+            "unexpected error: {error:#}"
+        );
         let _ = std::fs::remove_file(&stub);
     }
 }

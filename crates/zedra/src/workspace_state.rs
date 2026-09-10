@@ -276,7 +276,7 @@ pub struct WorkspaceState {
     // host's `WebClientWatch` stream. Rebuilt per connect, so not persisted.
     #[serde(skip)]
     pub web_clients: Vec<WebClientCard>,
-    // Live tmux shared sessions per agent slug (Pi today); not persisted.
+    // Live tmux shared sessions keyed by agent slug; not persisted.
     #[serde(skip)]
     pub shared_sessions: Vec<AgentSharedSessions>,
 }
@@ -651,6 +651,20 @@ impl WorkspaceState {
         cx: &mut Context<Self>,
     ) -> bool {
         let changed = self.replace_shared_sessions_snapshot(slug, outcome);
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// Clear every live share after the connection rejects shared-session RPCs.
+    /// Returns true only when consumer-visible snapshot data changed.
+    pub fn clear_shared_session_snapshots(&mut self, cx: &mut Context<Self>) -> bool {
+        let changed = self
+            .shared_sessions
+            .iter()
+            .any(|entry| entry.available || !entry.sessions.is_empty());
+        self.shared_sessions.clear();
         if changed {
             cx.notify();
         }
@@ -1110,19 +1124,34 @@ mod tests {
                 state: AgentState::Running,
                 path: "/session/1".into(),
             }],
-            shared_sessions: vec![AgentSharedSessions {
-                slug: "pi".into(),
-                available: true,
-                sessions: vec![AgentShareSession {
-                    session_id: "s1".into(),
-                    title: None,
-                    cwd: None,
-                    current_command: None,
-                    dead: false,
-                    exit_code: None,
-                }],
-                logged_unavailable: None,
-            }],
+            shared_sessions: vec![
+                AgentSharedSessions {
+                    slug: "pi".into(),
+                    available: true,
+                    sessions: vec![AgentShareSession {
+                        session_id: "same-id".into(),
+                        title: None,
+                        cwd: None,
+                        current_command: None,
+                        dead: false,
+                        exit_code: None,
+                    }],
+                    logged_unavailable: None,
+                },
+                AgentSharedSessions {
+                    slug: "omp".into(),
+                    available: true,
+                    sessions: vec![AgentShareSession {
+                        session_id: "same-id".into(),
+                        title: None,
+                        cwd: None,
+                        current_command: None,
+                        dead: false,
+                        exit_code: None,
+                    }],
+                    logged_unavailable: None,
+                },
+            ],
             ..Default::default()
         };
 
@@ -1148,7 +1177,7 @@ mod tests {
             available: true,
             version: "3.3a".into(),
             sessions: vec![AgentShareSession {
-                session_id: "s1".into(),
+                session_id: "same-id".into(),
                 title: Some("t".into()),
                 cwd: None,
                 current_command: None,
@@ -1174,6 +1203,17 @@ mod tests {
                 cx
             ))
         );
+        assert!(
+            state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "omp",
+                Ok(&live),
+                cx
+            ))
+        );
+        assert!(state.update(&mut cx, |state, _| {
+            state.shared_session("pi", "same-id").is_some()
+                && state.shared_session("omp", "same-id").is_some()
+        }));
         // The identical snapshot again: no change, no observers notified.
         assert!(
             !state.update(&mut cx, |state, cx| state.apply_shared_sessions(
@@ -1183,8 +1223,8 @@ mod tests {
             ))
         );
 
-        // Unavailable result clears shares and is remembered as logged once;
-        // becoming available again resets the one-warning-per-stretch guard.
+        // Infrastructure failure clears only that actor and records one
+        // warning guard for the unavailable stretch.
         assert!(
             state.update(&mut cx, |state, cx| state.apply_shared_sessions(
                 "pi",
@@ -1199,32 +1239,35 @@ mod tests {
         assert!(entry.sessions.is_empty());
         assert_eq!(entry.logged_unavailable.as_deref(), Some("no usable tmux"));
         assert!(
-            state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+            !state.update(&mut cx, |state, cx| state.apply_shared_sessions(
                 "pi",
-                Ok(&live),
+                Ok(&unavailable),
                 cx
             ))
         );
-        assert_eq!(
-            state.update(&mut cx, |state, _| state
-                .shared_sessions("pi")
-                .unwrap()
-                .logged_unavailable
-                .clone()),
-            None
-        );
+        assert!(state.update(&mut cx, |state, _| {
+            state.shared_session("omp", "same-id").is_some()
+        }));
 
-        // Removing a share drops exactly that session id (termination path);
-        // an id outside the snapshot reports no change.
-        assert!(!state.update(&mut cx, |state, cx| {
-            state.remove_shared_session("pi", "s2", cx)
+        // Same ids in different namespaces are removed independently.
+        assert!(state.update(&mut cx, |state, cx| {
+            state.apply_shared_sessions("pi", Ok(&live), cx)
         }));
         assert!(state.update(&mut cx, |state, cx| {
-            state.remove_shared_session("pi", "s1", cx)
+            state.remove_shared_session("pi", "same-id", cx)
         }));
         assert!(state.update(&mut cx, |state, _| {
-            state.shared_sessions("pi").unwrap().sessions.is_empty()
+            state.shared_session("pi", "same-id").is_none()
+                && state.shared_session("omp", "same-id").is_some()
         }));
+
+        assert!(state.update(&mut cx, |state, cx| {
+            state.apply_shared_sessions("pi", Ok(&live), cx)
+        }));
+        assert!(state.update(&mut cx, |state, cx| {
+            state.clear_shared_session_snapshots(cx)
+        }));
+        assert!(state.update(&mut cx, |state, _| state.shared_sessions.is_empty()));
     }
 
     #[test]
