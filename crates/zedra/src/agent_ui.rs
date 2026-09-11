@@ -705,8 +705,90 @@ pub fn render_session_card(props: SessionCardProps<'_>, cx: &App) -> Stateful<Di
         slug,
         short_id(&session.session_id)
     ));
+    let branch = session
+        .git
+        .as_ref()
+        .and_then(|git| git.branch.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let metadata_tail = session.transcript_size_bytes.map(format_size).map(|tail| {
+        div()
+            .flex_shrink_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(tail)
+            .into_any_element()
+    });
+    let trailing_status = props
+        .shared
+        .map(|shared| shared_status_badge(shared, cx).into_any_element());
 
+    session_card_body(
+        item_id,
+        crate::agent::icon(&slug),
+        session_title(session),
+        session.last_activity_at.or(session.created_at),
+        branch,
+        metadata_tail,
+        trailing_status,
+        cx,
+    )
+    .when(props.resume_on_tap && can_resume, |el| {
+        el.cursor_pointer().on_press({
+            let session_id = session_id.clone();
+            let slug = slug.clone();
+            move |_event, window, cx| {
+                platform_bridge::trigger_haptic(HapticFeedback::ImpactLight);
+                window.dispatch_action(
+                    workspace_action::ResumeAgentSession {
+                        slug: slug.clone(),
+                        session_id: session_id.clone(),
+                    }
+                    .boxed_clone(),
+                    cx,
+                );
+            }
+        })
+    })
+    .when(offers_terminate(props.shared), |el| {
+        el.on_long_press({
+            let session_id = session_id.clone();
+            let slug = slug.clone();
+            move |_event, window, cx| {
+                platform_bridge::trigger_haptic(HapticFeedback::ImpactMedium);
+                window.dispatch_action(
+                    workspace_action::TerminateSharedAgentSession {
+                        slug: slug.clone(),
+                        session_id: session_id.clone(),
+                    }
+                    .boxed_clone(),
+                    cx,
+                );
+            }
+        })
+    })
+}
+
+pub fn session_title(session: &AgentSessionSummary) -> String {
+    session
+        .title
+        .clone()
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn session_card_body(
+    item_id: SharedString,
+    icon_path: String,
+    title: String,
+    timestamp: Option<DateTime<Utc>>,
+    branch: String,
+    metadata_tail: Option<AnyElement>,
+    trailing_status: Option<AnyElement>,
+    cx: &App,
+) -> Stateful<Div> {
     div()
+        .id(item_id)
         .w_full()
         .min_w_0()
         .px(px(theme::SPACING_MD))
@@ -719,44 +801,9 @@ pub fn render_session_card(props: SessionCardProps<'_>, cx: &App) -> Stateful<Di
         .flex_row()
         .items_center()
         .gap(px(10.0))
-        .when(props.resume_on_tap && can_resume, |el| {
-            el.cursor_pointer().on_press({
-                let session_id = session_id.clone();
-                let slug = slug.clone();
-                move |_event, window, cx| {
-                    platform_bridge::trigger_haptic(HapticFeedback::ImpactLight);
-                    window.dispatch_action(
-                        workspace_action::ResumeAgentSession {
-                            slug: slug.clone(),
-                            session_id: session_id.clone(),
-                        }
-                        .boxed_clone(),
-                        cx,
-                    );
-                }
-            })
-        })
-        .when(offers_terminate(props.shared), |el| {
-            el.on_long_press({
-                let session_id = session_id.clone();
-                let slug = slug.clone();
-                move |_event, window, cx| {
-                    platform_bridge::trigger_haptic(HapticFeedback::ImpactMedium);
-                    window.dispatch_action(
-                        workspace_action::TerminateSharedAgentSession {
-                            slug: slug.clone(),
-                            session_id: session_id.clone(),
-                        }
-                        .boxed_clone(),
-                        cx,
-                    );
-                }
-            })
-        })
-        .id(item_id)
         .child(
             svg()
-                .path(crate::agent::icon(&slug))
+                .path(icon_path)
                 .size(px(theme::ICON_MD))
                 .flex_shrink_0()
                 .text_color(rgb(theme::text_muted(cx))),
@@ -768,24 +815,18 @@ pub fn render_session_card(props: SessionCardProps<'_>, cx: &App) -> Stateful<Di
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
-                .child(session_title_row(session, props.shared, cx))
-                .child(session_meta_row(session, cx)),
+                .child(session_title_row(title, timestamp, trailing_status, cx))
+                .child(session_meta_row(branch, metadata_tail, cx)),
         )
-}
-pub fn session_title(session: &AgentSessionSummary) -> String {
-    session
-        .title
-        .clone()
-        .filter(|title| !title.is_empty())
-        .unwrap_or_else(|| "Unknown".to_string())
 }
 
 fn session_title_row(
-    session: &AgentSessionSummary,
-    shared: Option<&AgentShareSession>,
+    title: String,
+    timestamp: Option<DateTime<Utc>>,
+    trailing_status: Option<AnyElement>,
     cx: &App,
 ) -> Div {
-    let mut row = div()
+    div()
         .w_full()
         .min_w_0()
         .flex()
@@ -796,28 +837,21 @@ fn session_title_row(
             div()
                 .flex_1()
                 .min_w_0()
-                // Trim long titles to the row width at render time (host only
-                // applies a generous anti-abuse cap).
                 .truncate()
                 .text_size(px(theme::FONT_BODY))
                 .text_color(rgb(theme::text_primary(cx)))
-                .child(session_title(session)),
+                .child(title),
         )
-        .when_some(shared, |row, shared| {
-            row.child(shared_status_badge(shared, cx))
-        });
-
-    if let Some(at) = session.last_activity_at.or(session.created_at) {
-        row = row.child(
-            div()
-                .flex_shrink_0()
-                .text_size(px(theme::FONT_DETAIL))
-                .text_color(rgb(theme::text_muted(cx)))
-                .child(format_session_time(at)),
-        );
-    }
-
-    row
+        .when_some(trailing_status, |row, status| row.child(status))
+        .when_some(timestamp, |row, at| {
+            row.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(theme::FONT_DETAIL))
+                    .text_color(rgb(theme::text_muted(cx)))
+                    .child(format_session_time(at)),
+            )
+        })
 }
 
 /// Small semantic status chip: green while the shared pane runs, muted once
@@ -843,20 +877,12 @@ fn shared_status_badge(shared: &AgentShareSession, cx: &App) -> Div {
         .child(status.label())
 }
 
-fn session_meta_row(session: &AgentSessionSummary, cx: &App) -> impl IntoElement {
-    let branch = session
-        .git
-        .as_ref()
-        .and_then(|git| git.branch.clone())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    let right = session_meta_tail(session);
-
+fn session_meta_row(
+    branch: String,
+    metadata_tail: Option<AnyElement>,
+    cx: &App,
+) -> impl IntoElement {
     div()
-        .id(SharedString::from(format!(
-            "session-card-meta-{}",
-            short_id(&session.session_id)
-        )))
         .w_full()
         .min_w_0()
         .flex()
@@ -889,22 +915,7 @@ fn session_meta_row(session: &AgentSessionSummary, cx: &App) -> impl IntoElement
                         .child(branch),
                 ),
         )
-        .when(!right.is_empty(), |el| {
-            el.child(
-                div()
-                    .flex_shrink_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(right),
-            )
-        })
-}
-
-fn session_meta_tail(session: &AgentSessionSummary) -> String {
-    session
-        .transcript_size_bytes
-        .map(format_size)
-        .unwrap_or_default()
+        .when_some(metadata_tail, |row, tail| row.child(tail))
 }
 
 fn format_size(bytes: u64) -> String {
@@ -1026,33 +1037,49 @@ pub fn flatten_session_sections(sections: Vec<AgentSessionSection>) -> Vec<Agent
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum TmuxSessionStatusModel {
+    Live,
+    Devices(Vec<(&'static str, u32)>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct TmuxSessionRowModel {
-    secondary_label: String,
+    title: String,
     icon_path: String,
-    attach_agent_slug: Option<String>,
+    attach_agent_slug: String,
+    timestamp: Option<DateTime<Utc>>,
+    branch: String,
+    transcript_size_bytes: Option<u64>,
+    status: TmuxSessionStatusModel,
 }
 
 fn tmux_session_row_model(session: &TmuxSessionSummary) -> TmuxSessionRowModel {
-    let mut seen = HashSet::new();
-    let agent_slugs: Vec<&str> = session
-        .agent_slugs
-        .iter()
-        .map(String::as_str)
-        .filter(|slug| seen.insert(*slug))
-        .collect();
-    let secondary_label = agent_slugs
-        .iter()
-        .map(|slug| crate::agent::name(slug))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let (icon_path, attach_agent_slug) = match agent_slugs.as_slice() {
-        [slug] => (crate::agent::icon(slug), Some((*slug).to_string())),
-        _ => ("icons/terminal.svg".to_string(), None),
-    };
+    let mut devices = Vec::new();
+    if session.clients.phone > 0 {
+        devices.push(("icons/smartphone.svg", session.clients.phone));
+    }
+    if session.clients.tablet > 0 {
+        devices.push(("icons/tablet.svg", session.clients.tablet));
+    }
+    if session.clients.desktop > 0 {
+        devices.push(("icons/laptop.svg", session.clients.desktop));
+    }
     TmuxSessionRowModel {
-        secondary_label,
-        icon_path,
-        attach_agent_slug,
+        title: session.title.clone(),
+        icon_path: crate::agent::icon(&session.agent_slug),
+        attach_agent_slug: session.agent_slug.clone(),
+        timestamp: session.last_activity_at,
+        branch: session
+            .git_branch
+            .clone()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+        transcript_size_bytes: session.transcript_size_bytes,
+        status: if devices.is_empty() {
+            TmuxSessionStatusModel::Live
+        } else {
+            TmuxSessionStatusModel::Devices(devices)
+        },
     }
 }
 
@@ -1066,7 +1093,7 @@ fn tmux_session_actions(
     (
         workspace_action::AttachTmuxSession {
             name: session.name.clone(),
-            agent_slug: model.attach_agent_slug.clone(),
+            agent_slug: Some(model.attach_agent_slug.clone()),
         },
         workspace_action::ManageTmuxSession {
             name: session.name.clone(),
@@ -1074,70 +1101,101 @@ fn tmux_session_actions(
     )
 }
 
-fn render_tmux_session_card(session: &TmuxSessionSummary, cx: &App) -> Stateful<Div> {
-    let model = tmux_session_row_model(session);
-    let (attach_action, manage_action) = tmux_session_actions(session, &model);
+fn tmux_status(status: &TmuxSessionStatusModel, cx: &App) -> AnyElement {
+    match status {
+        TmuxSessionStatusModel::Live => div()
+            .flex_shrink_0()
+            .px(px(theme::BADGE_PX))
+            .py(px(theme::BADGE_PY))
+            .rounded(px(theme::BADGE_RADIUS))
+            .bg(rgb(theme::bg_card(cx)))
+            .border_1()
+            .border_color(rgb(theme::border_subtle(cx)))
+            .text_size(px(theme::FONT_DETAIL))
+            .text_color(rgb(theme::accent_green(cx)))
+            .whitespace_nowrap()
+            .child("Live")
+            .into_any_element(),
+        TmuxSessionStatusModel::Devices(devices) => {
+            let mut row = div()
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .whitespace_nowrap();
+            for (icon, count) in devices {
+                row = row.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.0))
+                        .text_size(px(theme::FONT_DETAIL))
+                        .text_color(rgb(theme::accent_green(cx)))
+                        .child(
+                            svg()
+                                .path(*icon)
+                                .size(px(theme::ICON_XS))
+                                .flex_shrink_0()
+                                .text_color(rgb(theme::accent_green(cx))),
+                        )
+                        .child(count.to_string()),
+                );
+            }
+            row.into_any_element()
+        }
+    }
+}
 
-    div()
-        .id(SharedString::from(format!(
-            "tmux-session-card-{}",
-            session.name
-        )))
-        .w_full()
+fn tmux_metadata_tail(session: &TmuxSessionSummary, cx: &App) -> AnyElement {
+    let mut tail = div()
         .min_w_0()
-        .px(px(theme::SPACING_MD))
-        .py(px(theme::SPACING_SM))
-        .rounded(px(6.0))
-        .border_1()
-        .border_color(rgb(theme::border_subtle(cx)))
-        .bg(rgb(theme::bg_card_dim(cx)))
-        .active(|style| style.bg(theme::row_pressed_bg(cx)))
-        .cursor_pointer()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(10.0))
-        .on_press(move |_event, window, cx| {
-            platform_bridge::trigger_haptic(HapticFeedback::ImpactLight);
-            window.dispatch_action(attach_action.boxed_clone(), cx);
-        })
-        .on_long_press(move |_event, window, cx| {
-            platform_bridge::trigger_haptic(HapticFeedback::ImpactMedium);
-            window.dispatch_action(manage_action.boxed_clone(), cx);
-        })
-        .child(
-            svg()
-                .path(model.icon_path)
-                .size(px(theme::ICON_MD))
-                .flex_shrink_0()
-                .text_color(rgb(theme::text_muted(cx))),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap(px(4.0))
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(theme::FONT_BODY))
-                        .text_color(rgb(theme::text_primary(cx)))
-                        .child(session.name.clone()),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(theme::FONT_DETAIL))
-                        .text_color(rgb(theme::text_muted(cx)))
-                        .child(model.secondary_label),
-                ),
-        )
+        .gap(px(6.0))
+        .overflow_hidden()
+        .whitespace_nowrap();
+    if let Some(bytes) = session.transcript_size_bytes {
+        tail = tail.child(div().flex_shrink_0().child(format_size(bytes)));
+    }
+    tail.child(
+        div()
+            .min_w_0()
+            .truncate()
+            .text_color(rgb(theme::accent_green(cx)))
+            .child(session.name.clone()),
+    )
+    .into_any_element()
+}
+
+fn render_tmux_session_card(session: &TmuxSessionSummary, cx: &App) -> Stateful<Div> {
+    let model = tmux_session_row_model(session);
+    let (attach_action, manage_action) = tmux_session_actions(session, &model);
+    let status = tmux_status(&model.status, cx);
+    let metadata_tail = tmux_metadata_tail(session, cx);
+
+    session_card_body(
+        SharedString::from(format!("tmux-session-card-{}", session.name)),
+        model.icon_path,
+        model.title,
+        model.timestamp,
+        model.branch,
+        Some(metadata_tail),
+        Some(status),
+        cx,
+    )
+    .active(|style| style.bg(theme::row_pressed_bg(cx)))
+    .cursor_pointer()
+    .on_press(move |_event, window, cx| {
+        platform_bridge::trigger_haptic(HapticFeedback::ImpactLight);
+        window.dispatch_action(attach_action.boxed_clone(), cx);
+    })
+    .on_long_press(move |_event, window, cx| {
+        platform_bridge::trigger_haptic(HapticFeedback::ImpactMedium);
+        window.dispatch_action(manage_action.boxed_clone(), cx);
+    })
 }
 
 pub fn new_session_list_state(row_count: usize) -> ListState {
@@ -1240,13 +1298,13 @@ fn day_label(at: Option<DateTime<Utc>>) -> String {
 mod tests {
     use super::{
         AgentSessionItem, AgentSessionSummary, AgentShareSession, SharedSessionPollControl,
-        SharedSessionPollState, SharedSessionStatus, TmuxSessionSummary, group_sessions_by_day,
-        merge_shared_sessions, offers_terminate, shared_session_status, tmux_session_actions,
-        tmux_session_row_model,
+        SharedSessionPollState, SharedSessionStatus, TmuxSessionStatusModel, TmuxSessionSummary,
+        group_sessions_by_day, merge_shared_sessions, offers_terminate, shared_session_status,
+        tmux_session_actions, tmux_session_row_model,
     };
     use crate::workspace_state::AgentSharedSessions;
     use chrono::Utc;
-    use zedra_rpc::proto::AgentResumeSummary;
+    use zedra_rpc::proto::{AgentResumeSummary, TmuxClientCounts};
 
     fn summary(slug: &str, id: &str, hours_ago: i64) -> AgentSessionSummary {
         let at = Utc::now() - chrono::Duration::hours(hours_ago);
@@ -1404,38 +1462,57 @@ mod tests {
         assert_eq!(state.pollable_targets(), ["omp", "claude"]);
     }
 
-    #[test]
-    fn tmux_row_uses_single_agent_label_icon_and_attach_identity() {
-        let session = TmuxSessionSummary {
+    fn tmux_summary(title: &str, clients: TmuxClientCounts) -> TmuxSessionSummary {
+        TmuxSessionSummary {
             name: "cars_us".into(),
-            agent_slugs: vec!["pi".into()],
-        };
-        let model = tmux_session_row_model(&session);
-        let (attach, manage) = tmux_session_actions(&session, &model);
-
-        assert_eq!(model.secondary_label, "Pi");
-        assert_eq!(model.icon_path, "icons/pi.svg");
-        assert_eq!(model.attach_agent_slug.as_deref(), Some("pi"));
-        assert_eq!(attach.name, "cars_us");
-        assert_eq!(attach.agent_slug.as_deref(), Some("pi"));
-        assert_eq!(manage.name, "cars_us");
+            agent_slug: "pi".into(),
+            title: title.into(),
+            last_activity_at: Some(Utc::now()),
+            git_branch: Some("feat/cards".into()),
+            transcript_size_bytes: Some(4096),
+            clients,
+        }
     }
 
     #[test]
-    fn tmux_row_uses_terminal_icon_and_all_distinct_agent_names_for_multiple_agents() {
-        let session = TmuxSessionSummary {
-            name: "review swarm".into(),
-            agent_slugs: vec!["pi".into(), "claude".into(), "pi".into()],
-        };
-        let model = tmux_session_row_model(&session);
-        let (attach, manage) = tmux_session_actions(&session, &model);
+    fn tmux_row_uses_host_metadata_and_exact_actions() {
+        for title in ["Historical title", "Pane title", "Unknown"] {
+            let session = tmux_summary(title, TmuxClientCounts::default());
+            let model = tmux_session_row_model(&session);
+            let (attach, manage) = tmux_session_actions(&session, &model);
 
-        assert_eq!(model.secondary_label, "Pi · Claude Code");
-        assert_eq!(model.icon_path, "icons/terminal.svg");
-        assert_eq!(model.attach_agent_slug, None);
-        assert_eq!(attach.name, "review swarm");
-        assert_eq!(attach.agent_slug, None);
-        assert_eq!(manage.name, "review swarm");
+            assert_eq!(model.title, title);
+            assert_eq!(model.icon_path, "icons/pi.svg");
+            assert_eq!(model.attach_agent_slug, "pi");
+            assert_eq!(model.branch, "feat/cards");
+            assert_eq!(model.transcript_size_bytes, Some(4096));
+            assert_eq!(attach.name, "cars_us");
+            assert_eq!(attach.agent_slug.as_deref(), Some("pi"));
+            assert_eq!(manage.name, "cars_us");
+        }
+    }
+
+    #[test]
+    fn tmux_row_live_state_is_mutually_exclusive_and_device_ordered() {
+        let live = tmux_session_row_model(&tmux_summary("Pane title", TmuxClientCounts::default()));
+        assert_eq!(live.status, TmuxSessionStatusModel::Live);
+
+        let attached = tmux_session_row_model(&tmux_summary(
+            "Pane title",
+            TmuxClientCounts {
+                phone: 2,
+                tablet: 1,
+                desktop: 3,
+            },
+        ));
+        assert_eq!(
+            attached.status,
+            TmuxSessionStatusModel::Devices(vec![
+                ("icons/smartphone.svg", 2),
+                ("icons/tablet.svg", 1),
+                ("icons/laptop.svg", 3),
+            ])
+        );
     }
 
     #[test]

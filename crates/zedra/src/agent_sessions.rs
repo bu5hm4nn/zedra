@@ -398,12 +398,17 @@ mod tests {
         apply_tmux_poll_result, build_session_rows,
     };
     use chrono::Utc;
-    use zedra_rpc::proto::AgentResumeSummary;
+    use zedra_rpc::proto::{AgentResumeSummary, TmuxClientCounts};
 
-    fn tmux(name: &str, slugs: &[&str]) -> TmuxSessionSummary {
+    fn tmux(name: &str, slug: &str) -> TmuxSessionSummary {
         TmuxSessionSummary {
             name: name.into(),
-            agent_slugs: slugs.iter().map(|slug| (*slug).into()).collect(),
+            agent_slug: slug.into(),
+            title: format!("{name} title"),
+            last_activity_at: Some(Utc::now()),
+            git_branch: None,
+            transcript_size_bytes: None,
+            clients: TmuxClientCounts::default(),
         }
     }
 
@@ -437,7 +442,7 @@ mod tests {
 
     #[test]
     fn tmux_poll_keeps_last_success_across_unchanged_transport_error_stretch() {
-        let cars = tmux("cars_us", &["pi"]);
+        let cars = tmux("cars_us", "pi");
         let mut sessions = Vec::new();
         let mut error_stretch = None;
 
@@ -475,9 +480,9 @@ mod tests {
 
     #[test]
     fn tmux_poll_success_unavailable_and_downgrade_replace_only_custom_state() {
-        let mut sessions = vec![tmux("old", &["pi"])];
+        let mut sessions = vec![tmux("old", "pi")];
         let mut error_stretch = Some("offline".into());
-        let claude = tmux("claude-work", &["claude"]);
+        let claude = tmux("claude-work", "claude");
 
         let replacement = apply_tmux_poll_result(
             &mut sessions,
@@ -498,7 +503,7 @@ mod tests {
         assert!(unavailable.rows_changed);
         assert!(sessions.is_empty());
 
-        sessions.push(tmux("rediscovered", &["omp"]));
+        sessions.push(tmux("rediscovered", "omp"));
         error_stretch = Some("stale".into());
         let downgraded = apply_tmux_poll_result(
             &mut sessions,
@@ -515,7 +520,7 @@ mod tests {
     #[test]
     fn rebuild_prepends_tmux_section_without_fabricating_history() {
         let persisted = history("pi", "persisted");
-        let custom = vec![tmux("cars_us", &["pi"]), tmux("pair", &["pi", "omp"])];
+        let custom = vec![tmux("cars_us", "pi"), tmux("pair", "omp")];
         let rows = build_session_rows(vec![persisted.clone()], &[], &custom);
 
         match &rows[..] {

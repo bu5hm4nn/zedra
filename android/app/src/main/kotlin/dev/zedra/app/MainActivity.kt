@@ -130,7 +130,14 @@ class MainActivity : AppCompatActivity() {
 
         ZedraFirebase.initialize(this)
         createDeltaNotificationChannel(this)
-        bootstrap(this, APP_VERSION_VALUE, APP_BUILD_NUMBER_VALUE, OS_VERSION_VALUE, DEVICE_NAME_VALUE)
+        bootstrap(
+            this,
+            APP_VERSION_VALUE,
+            APP_BUILD_NUMBER_VALUE,
+            OS_VERSION_VALUE,
+            DEVICE_NAME_VALUE,
+            resources.configuration.smallestScreenWidthDp >= 600,
+        )
 
         runtime = GpuiRuntimeController(this)
         runtime.initialize()
@@ -439,6 +446,7 @@ class MainActivity : AppCompatActivity() {
             appBuildNumber: String,
             osVersion: String,
             deviceName: String,
+            isTablet: Boolean,
         )
 
         @JvmStatic external fun zedraLaunchGpui()

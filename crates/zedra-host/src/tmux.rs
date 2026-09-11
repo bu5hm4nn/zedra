@@ -23,6 +23,10 @@ pub const PROCESS_PANE_FORMAT: &str =
 pub const METADATA_PANE_FORMAT: &str =
     "#{pane_id}|#{pane_title}|#{pane_current_path}|#{pane_start_command}";
 
+/// Session name first; attached-client count and activity are parsed from the
+/// right so names may contain `|`.
+pub const SESSION_FORMAT: &str = "#{session_name}|#{session_attached}|#{session_activity}";
+
 /// Encode an agent/session identity into its owned tmux session name.
 pub fn owned_session_name(slug: &str, session_id: &str) -> Result<String> {
     validate_slug(slug)?;
@@ -219,6 +223,35 @@ pub fn parse_pane_metadata(line: &str) -> Result<PaneMetadata> {
         start_command: start_command.to_string(),
     })
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxSessionRecord {
+    name: String,
+    attached_clients: u32,
+    activity_unix_seconds: i64,
+}
+
+fn parse_session_record(line: &str) -> Result<TmuxSessionRecord> {
+    let (head, activity) = line
+        .rsplit_once('|')
+        .context("malformed tmux session record: missing activity")?;
+    let (name, attached_clients) = head
+        .rsplit_once('|')
+        .context("malformed tmux session record: missing attached-client count")?;
+    ensure!(
+        !name.is_empty(),
+        "malformed tmux session record: empty name"
+    );
+    Ok(TmuxSessionRecord {
+        name: name.to_string(),
+        attached_clients: attached_clients
+            .parse()
+            .with_context(|| format!("malformed session_attached value {attached_clients:?}"))?,
+        activity_unix_seconds: activity
+            .parse()
+            .with_context(|| format!("malformed session_activity value {activity:?}"))?,
+    })
+}
 // ---------------------------------------------------------------------------
 // Owned pane records and the concrete tmux client
 // ---------------------------------------------------------------------------
@@ -232,12 +265,17 @@ pub struct OwnedPane {
     pub metadata: PaneMetadata,
 }
 
-/// A non-owned tmux session containing at least one registered agent.
+/// A non-owned tmux session containing one coherent registered agent kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetectedTmuxSession {
     pub name: String,
-    pub agent_slugs: Vec<String>,
-    pub identity_command: Option<String>,
+    pub agent_slug: String,
+    pub identity_command: String,
+    pub pane_title: String,
+    pub current_path: String,
+    pub start_command: String,
+    pub attached_clients: u32,
+    pub activity_unix_seconds: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -483,17 +521,17 @@ impl TmuxClient {
         Ok(sessions)
     }
 
-    /// List non-owned sessions whose live panes identify a registered agent.
+    /// List non-owned sessions whose live panes identify one coherent agent.
     pub(crate) fn list_detected_sessions(&self) -> Result<Vec<DetectedTmuxSession>> {
-        let Some(session_text) = self.list_session_names()? else {
+        let Some(records) = self.list_session_records()? else {
             return Ok(Vec::new());
         };
         let mut sessions = Vec::new();
-        for name in session_text.lines() {
-            if name.starts_with(OWNED_SESSION_PREFIX) {
+        for record in records {
+            if record.name.starts_with(OWNED_SESSION_PREFIX) {
                 continue;
             }
-            if let Ok(Some(session)) = self.detect_session(name) {
+            if let Ok(Some(session)) = self.detect_session(&record) {
                 sessions.push(session);
             }
         }
@@ -507,7 +545,12 @@ impl TmuxClient {
             self.session_exists(name)?,
             "tmux session {name:?} no longer exists"
         );
-        let session = match self.detect_session(name) {
+        let record = TmuxSessionRecord {
+            name: name.to_string(),
+            attached_clients: 0,
+            activity_unix_seconds: 0,
+        };
+        let session = match self.detect_session(&record) {
             Ok(Some(session)) => session,
             Ok(None) => {
                 ensure!(
@@ -527,7 +570,7 @@ impl TmuxClient {
         let target = format!("={}", session.name);
         Ok((
             self.attach_command_with_shell_target(&shell_quote_always(&target)),
-            session.identity_command,
+            Some(session.identity_command),
         ))
     }
 
@@ -537,7 +580,12 @@ impl TmuxClient {
         if !self.session_exists(name)? {
             return Ok(());
         }
-        match self.detect_session(name) {
+        let record = TmuxSessionRecord {
+            name: name.to_string(),
+            attached_clients: 0,
+            activity_unix_seconds: 0,
+        };
+        match self.detect_session(&record) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 if !self.session_exists(name)? {
@@ -584,8 +632,8 @@ impl TmuxClient {
             .is_some_and(|session_text| session_text.lines().any(|candidate| candidate == name)))
     }
 
-    fn detect_session(&self, name: &str) -> Result<Option<DetectedTmuxSession>> {
-        let target = format!("={name}");
+    fn detect_session(&self, record: &TmuxSessionRecord) -> Result<Option<DetectedTmuxSession>> {
+        let target = format!("={}", record.name);
         let process_text = self.run_ok(
             &["list-panes", "-s", "-t", &target, "-F", PROCESS_PANE_FORMAT],
             "list detected session panes",
@@ -636,9 +684,8 @@ impl TmuxClient {
             "tmux pane process and metadata ids differ"
         );
 
-        let mut agent_slugs = Vec::new();
-        let mut identity_command = None;
-        for process in processes {
+        let mut selected: Option<(&str, &str, &PaneMetadata)> = None;
+        for process in &processes {
             if process.dead {
                 continue;
             }
@@ -657,26 +704,26 @@ impl TmuxClient {
                     .flatten()
                     .map(|slug| (slug, start_command))
             });
-            let Some((slug, command)) = detected else {
+            let Some((slug, identity_command)) = detected else {
                 continue;
             };
-            if !agent_slugs.iter().any(|known| known == slug) {
-                agent_slugs.push(slug.to_string());
+            if selected.is_some_and(|(selected_slug, _, _)| selected_slug != slug) {
+                return Ok(None);
             }
-            if identity_command.is_none() {
-                identity_command = Some(command.to_string());
-            }
+            selected.get_or_insert((slug, identity_command, pane_metadata));
         }
-        if agent_slugs.is_empty() {
+        let Some((agent_slug, identity_command, pane)) = selected else {
             return Ok(None);
-        }
-        if agent_slugs.len() != 1 {
-            identity_command = None;
-        }
+        };
         Ok(Some(DetectedTmuxSession {
-            name: name.to_string(),
-            agent_slugs,
-            identity_command,
+            name: record.name.clone(),
+            agent_slug: agent_slug.to_string(),
+            identity_command: identity_command.to_string(),
+            pane_title: pane.title.clone(),
+            current_path: pane.current_path.clone(),
+            start_command: pane.start_command.clone(),
+            attached_clients: record.attached_clients,
+            activity_unix_seconds: record.activity_unix_seconds,
         }))
     }
 
@@ -698,6 +745,27 @@ impl TmuxClient {
         String::from_utf8(output.stdout.clone())
             .map(Some)
             .context("tmux list sessions produced non-UTF-8 output")
+    }
+
+    fn list_session_records(&self) -> Result<Option<Vec<TmuxSessionRecord>>> {
+        let output = self.run(&["list-sessions", "-F", SESSION_FORMAT], "list sessions")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if Self::is_no_server(&stderr) {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "tmux list sessions failed with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        let text = String::from_utf8(output.stdout)
+            .context("tmux list sessions produced non-UTF-8 output")?;
+        text.lines()
+            .map(parse_session_record)
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     /// Both proven fresh-socket stderr variants mean no server, not a broken
@@ -869,6 +937,36 @@ mod tests {
             METADATA_PANE_FORMAT,
             "#{pane_id}|#{pane_title}|#{pane_current_path}|#{pane_start_command}"
         );
+        assert_eq!(
+            SESSION_FORMAT,
+            "#{session_name}|#{session_attached}|#{session_activity}"
+        );
+    }
+
+    #[test]
+    fn session_records_preserve_pipe_names_and_parse_presence() {
+        assert_eq!(
+            parse_session_record("cars|review|3|1726000000").unwrap(),
+            TmuxSessionRecord {
+                name: "cars|review".into(),
+                attached_clients: 3,
+                activity_unix_seconds: 1_726_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn session_records_reject_malformed_output() {
+        for line in [
+            "",
+            "name",
+            "name|1",
+            "|1|1726000000",
+            "name|many|1726000000",
+            "name|1|recent",
+        ] {
+            assert!(parse_session_record(line).is_err(), "line: {line:?}");
+        }
     }
 
     #[test]
@@ -1330,7 +1428,7 @@ mod tests {
         let script = "#!/bin/sh
 case \"$3\" in
 -V) echo 'tmux 3.5' ;;
-list-sessions) printf '%s\n' 'cars_us' 'single' 'shell-only' 'zedra-malformed' 'zedra-pi-61' 'bad-query' 'bad-record' ;;
+list-sessions) printf '%s\n' 'cars_us|2|1726000001' 'single|3|1726000002' 'shell-only|0|1726000003' 'zedra-malformed|0|1726000004' 'zedra-pi-61|0|1726000005' 'bad-query|0|1726000006' 'bad-record|0|1726000007' ;;
 list-panes)
   case \"$6\" in '=zedra-'*) : > \"$0.reserved\"; exit 1 ;; esac
   if [ \"$6\" = '=bad-query' ]; then echo 'pane query failed' >&2; exit 9; fi
@@ -1357,18 +1455,16 @@ exit 0
             .expect("detected session listing");
         assert_eq!(
             sessions,
-            [
-                DetectedTmuxSession {
-                    name: "cars_us".to_string(),
-                    agent_slugs: vec!["pi".to_string(), "omp".to_string()],
-                    identity_command: None,
-                },
-                DetectedTmuxSession {
-                    name: "single".to_string(),
-                    agent_slugs: vec!["claude".to_string()],
-                    identity_command: Some("claude --continue".to_string()),
-                },
-            ]
+            [DetectedTmuxSession {
+                name: "single".to_string(),
+                agent_slug: "claude".to_string(),
+                identity_command: "claude --continue".to_string(),
+                pane_title: "five".to_string(),
+                current_path: "/tmp".to_string(),
+                start_command: "claude --continue".to_string(),
+                attached_clients: 3,
+                activity_unix_seconds: 1_726_000_002,
+            }]
         );
         assert!(!marker.exists(), "reserved namespace reached list-panes");
 

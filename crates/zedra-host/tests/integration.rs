@@ -1508,6 +1508,7 @@ mod tmux_lifecycle {
                 name: name.to_string(),
                 cols: 80,
                 rows: 24,
+                device_kind: TmuxClientDeviceKind::Desktop,
             })
             .await
             .expect("attach custom tmux RPC");
@@ -1648,7 +1649,7 @@ mod tmux_lifecycle {
         assert!(listed.available, "tmux unavailable: {:?}", listed.error);
         assert_eq!(listed.version, version.to_string());
         assert!(listed.error.is_none());
-        let supported_names = [cars_name, claude_name, multi_name, metachar_name];
+        let supported_names = [cars_name, claude_name, metachar_name];
         let enumerated_names = tmux_text(&socket.name, &["list-sessions", "-F", "#{session_name}"]);
         let expected_custom_order: Vec<&str> = enumerated_names
             .lines()
@@ -1664,11 +1665,10 @@ mod tmux_lifecycle {
             "custom discovery must preserve tmux enumeration order"
         );
         assert_eq!(listed.sessions.len(), supported_names.len());
-        for (name, expected_slugs) in [
-            (cars_name, &["pi"][..]),
-            (claude_name, &["claude"][..]),
-            (multi_name, &["pi", "omp"][..]),
-            (metachar_name, &["claude"][..]),
+        for (name, expected_slug) in [
+            (cars_name, "pi"),
+            (claude_name, "claude"),
+            (metachar_name, "claude"),
         ] {
             let session = listed
                 .sessions
@@ -1676,21 +1676,17 @@ mod tmux_lifecycle {
                 .find(|session| session.name == name)
                 .unwrap_or_else(|| panic!("custom discovery omitted {name:?}"));
             assert_eq!(
-                session
-                    .agent_slugs
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-                expected_slugs,
-                "wrong detected actors for {name:?}"
+                session.agent_slug, expected_slug,
+                "wrong detected actor for {name:?}"
             );
         }
         assert!(
-            !listed
-                .sessions
-                .iter()
-                .any(|session| session.name == shell_name || session.name == owned_name),
-            "shell-only and owned sessions must stay outside custom discovery"
+            !listed.sessions.iter().any(|session| {
+                session.name == shell_name
+                    || session.name == owned_name
+                    || session.name == multi_name
+            }),
+            "shell-only, owned, and multi-agent sessions must stay outside custom discovery"
         );
 
         let cars_one_id = attach_custom_session(&rpc, cars_name).await;

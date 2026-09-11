@@ -56,6 +56,8 @@ static APP_VERSION: Mutex<Option<String>> = Mutex::new(None);
 static APP_BUILD_NUMBER: Mutex<Option<String>> = Mutex::new(None);
 static OS_VERSION: Mutex<Option<String>> = Mutex::new(None);
 static DEVICE_NAME: Mutex<Option<String>> = Mutex::new(None);
+static TMUX_CLIENT_IS_TABLET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Display density, soft keyboard height, and system insets are owned by the
 /// `gpui_android` framework. These thin wrappers preserve the historical
@@ -110,6 +112,10 @@ pub fn get_delta_device_name() -> String {
         .ok()
         .and_then(|g| g.clone())
         .unwrap_or_default()
+}
+
+pub fn tmux_client_is_tablet() -> bool {
+    TMUX_CLIENT_IS_TABLET.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Initialize logging + panic hook. Idempotent; safe to call from multiple
@@ -231,7 +237,7 @@ pub extern "system" fn Java_dev_zedra_app_SheetHostView_nativeSheetProcessSurfac
 // ============================================================================
 
 /// Called from `MainActivity.onCreate` via
-/// `MainActivity.bootstrap(activity, appVersion, appBuildNumber, osVersion, deviceName)`.
+/// `MainActivity.bootstrap(activity, appVersion, appBuildNumber, osVersion, deviceName, isTablet)`.
 ///
 /// Captures the JVM (for Rust→Java callbacks), the files directory, and native
 /// app/device metadata. Pushing metadata in this direction (Java→Rust)
@@ -246,8 +252,10 @@ pub extern "system" fn Java_dev_zedra_app_MainActivity_bootstrap(
     app_build_number: jni::objects::JString,
     os_version: jni::objects::JString,
     device_name: jni::objects::JString,
+    is_tablet: jboolean,
 ) {
     init_logging();
+    TMUX_CLIENT_IS_TABLET.store(is_tablet != 0, std::sync::atomic::Ordering::Relaxed);
 
     if let Ok(jvm) = env.get_java_vm() {
         if let Ok(mut guard) = JVM.lock() {

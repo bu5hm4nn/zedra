@@ -2588,119 +2588,110 @@ container recreation.
 
 This matrix covers non-owned tmux sessions separately from the encoded Pi and
 OMP targets above. Keep at least one persisted agent-history row in the
-workspace throughout the matrix. Use the same tmux socket as the host, following
-the `tmux -S <tmux.socket>` rule at the start of this section.
+workspace. Use the same tmux socket as the host, following the
+`tmux -S <tmux.socket>` rule at the start of this section.
 
-1. Create blocking, local fixtures whose executable names are recognized
-   without authentication or network access, then create the custom, unsupported,
-   multi-agent, and reserved sessions:
+1. Choose a persisted, resumable agent session and copy the exact resume command
+   produced by the host actor or `agents.overrides`. Create a custom session with
+   that command. Create pane-title, unnamed, shell-only, multi-agent, and reserved
+   controls:
 
    ```bash
    FIXTURE_DIR="$(mktemp -d)"
    cp "$(command -v cat)" "$FIXTURE_DIR/pi"
    cp "$(command -v cat)" "$FIXTURE_DIR/omp"
-   cp "$(command -v cat)" "$FIXTURE_DIR/claude"
-   chmod +x "$FIXTURE_DIR/pi" "$FIXTURE_DIR/omp" "$FIXTURE_DIR/claude"
+   chmod +x "$FIXTURE_DIR/pi" "$FIXTURE_DIR/omp"
 
-   tmux new-session -d -s cars_us "$FIXTURE_DIR/pi"
-   tmux new-session -d -s claude_custom "$FIXTURE_DIR/claude"
+   tmux new-session -d -s exact_history '<exact resume command>'
+   tmux new-session -d -s pane_title "$FIXTURE_DIR/pi"
+   tmux select-pane -t '=pane_title' -T 'Custom pane title'
+   tmux new-session -d -s unnamed "$FIXTURE_DIR/pi"
+   tmux select-pane -t '=unnamed' -T ''
+   tmux new-session -d -s shell_only /bin/sh
    tmux new-session -d -s mixed_agents "$FIXTURE_DIR/pi"
    tmux split-window -d -t '=mixed_agents' "$FIXTURE_DIR/omp"
-   tmux split-window -d -t '=mixed_agents' "$FIXTURE_DIR/pi"
-   tmux new-session -d -s shell_only /bin/sh
-   tmux new-session -d -s zedra-pi-6d616e75616c2d636f6e74726f6c "$FIXTURE_DIR/pi"
    tmux new-session -d -s zedra-malformed "$FIXTURE_DIR/pi"
    ```
 
-   Expected: all six sessions exist on the selected server. `cars_us` has one
-   detected Pi pane, `claude_custom` has one detected Claude pane, and
-   `mixed_agents` has Pi, OMP, and a duplicate Pi pane. `shell_only` has no
-   registered actor. Both names beginning with `zedra-` are reserved, regardless
-   of whether the remainder is a valid owned-session encoding.
-2. Connect the app and open the existing `View sessions` / Resume Session
-   surface. Expected: the first section is `Tmux sessions`, ahead of the normal
-   Today/Yesterday date groups. It contains `cars_us`, `claude_custom`, and
-   `mixed_agents` in tmux enumeration order. It does not contain `shell_only`,
-   the encoded `zedra-pi-*` control, or the malformed `zedra-*` control.
-3. Expected row details: the primary labels are the exact tmux names;
-   `cars_us` has the Pi icon and `Pi` secondary label; `claude_custom` has the
-   Claude icon and `Claude Code` secondary label; and `mixed_agents` has the
-   generic terminal icon and the deduplicated `Pi · Omp` secondary label in pane
-   detection order.
-4. Compare the history below the custom section with its pre-fixture state.
-   Expected: every persisted row, date group, live badge, and resume action is
-   unchanged. No custom row is fabricated as agent history or inserted into a
-   date group. Toggle the device between light and dark appearance. Expected:
-   the custom header and cards remain legible and use the same spacing, borders,
-   pressed styling, and theme colors as the history cards.
-5. Before tapping `cars_us`, record its pane PID with
-   `tmux display-message -p -t '=cars_us' '#{pane_pid}'`. Tap the `cars_us` row.
-   Expected: a normal Zedra terminal card opens, attached to that exact session;
-   no new tmux session, resumed provider session, or fallback shell is created.
-6. From a desktop shell, run `tmux attach-session -t '=cars_us'`. Type lines in
-   the desktop client and in the Zedra card. Expected: both clients show the
-   same bidirectional pane input/output. Tap the `cars_us` row again. Expected:
-   a second independent Zedra terminal card attaches and stays synchronized
-   with the first card and desktop client.
-7. Close one Zedra card through the normal terminal-card close flow. Expected:
-   only that attach-client PTY closes; the other Zedra card and desktop client
-   remain attached. `tmux has-session -t '=cars_us'` still succeeds and the pane
-   PID recorded in step 5 is unchanged. Close the second Zedra card. Expected:
-   `cars_us`, its pane PID, and the desktop client still survive.
-8. Reopen two Zedra attachments to `cars_us`, then long-press its row. Expected:
-   medium haptic feedback and a native sheet titled `cars_us` with destructive
-   `Terminate Session` and `Cancel` actions. Tap `Cancel`. Expected: the sheet
-   closes without changing any tmux session, pane, desktop client, or terminal
-   card.
-9. Long-press `cars_us` again, select `Terminate Session`, and inspect the
-   confirmation. Expected: title `Terminate tmux session?`, body
-   `This stops every process in “cars_us” and disconnects every attached
-   terminal.`, and `Terminate` / `Cancel` buttons. Tap `Cancel`. Expected:
-   `cars_us` and all of its clients remain unchanged.
-10. Repeat step 9 and tap `Terminate`. Expected: only `cars_us` and its pane
-    stop; its desktop client disconnects, both matching Zedra terminal cards
-    close through the normal terminal lifecycle, and the `cars_us` row
-    disappears on the next poll. `claude_custom`, `mixed_agents`, `shell_only`,
-    both reserved controls, their panes, and any terminals attached to them
-    remain unchanged. Persisted agent history and owned Pi/OMP live sessions
-    also remain unchanged.
-11. Recreate `cars_us` with
-    `tmux new-session -d -s cars_us "$FIXTURE_DIR/pi"`. Stop and restart
-    `zedra-host` without stopping the selected tmux server, reconnect the app,
-    and reopen View sessions. Expected: every surviving supported custom
-    session, including the recreated `cars_us`, survives and is rediscovered at
-    the top of the list with the same labels; attaching `cars_us` works again.
-12. Create a race fixture with
-    `tmux new-session -d -s race_pi "$FIXTURE_DIR/pi"`, wait for `race_pi` to
-    appear in `Tmux sessions`, then from another shell run
-    `tmux kill-session -t '=race_pi'` and immediately tap the still-visible row
-    before the next two-second poll. Expected: no shell fallback and no terminal
-    card remains, including the temporary `Attaching race_pi…` card. The app
-    returns to the previous/default route and shows `Attach Tmux Session` with
-    `Failed to attach to the tmux session.` followed by the actionable host
-    error. If polling removes the row before it can be tapped, recreate the
-    fixture and repeat.
-13. Stop the host and restart the same workspace with an absolute `zedra`
-    executable and a controlled `PATH` that cannot find `tmux`. Reconnect and
-    open View sessions. Expected: only the `Tmux sessions` section disappears;
-    persisted Agent History, its grouping and resume rows, and ordinary
-    terminals remain usable. No stale custom rows or persistent error banner
-    remains. Restore the normal `PATH`, restart the host, and expected: the
-    supported custom rows rediscover.
-14. Start a host version from before the custom-tmux RPCs, connect the current
-    app, and open View sessions. Expected: the custom section is omitted without
-    breaking or hiding persisted history. Ordinary terminals and that host's
-    existing owned Pi/OMP shared-session behavior remain usable; the
-    incompatible custom capability does not disable their RPCs or produce a
-    repeated visible error.
-15. Cleanup against the selected socket:
+   Expected: all six sessions exist. `exact_history`, `pane_title`, and
+   `unnamed` contain one registered agent kind. `mixed_agents` contains two
+   distinct registered agent kinds.
+2. Connect an iPhone and open `View sessions`. Expected: `Tmux sessions` appears
+   before the date groups and contains only `exact_history`, `pane_title`, and
+   `unnamed`, in tmux enumeration order. `shell_only`, `mixed_agents`, and the
+   reserved `zedra-*` control are omitted.
+3. Compare the custom cards with persisted history cards. Expected: both use the
+   same card fill, border, padding, agent icon size, title typography, timestamp,
+   git-branch row, and `unknown` branch fallback. The custom card titles are the
+   persisted history title for `exact_history`, `Custom pane title` for
+   `pane_title`, and `Unknown` for `unnamed`.
+4. Inspect each custom card before attaching any client. Expected: the byte-exact
+   tmux name is green at the metadata row's right. A green `Live` badge appears
+   at the top right. No device icon/count appears with `Live`.
+5. Record `pane_title`'s pane PID with
+   `tmux display-message -p -t '=pane_title' '#{pane_pid}'`. Tap its row.
+   Expected: light haptic feedback and a normal terminal card attached to that
+   exact session. No new tmux session, resumed provider session, or fallback
+   shell is created.
+6. Return to `View sessions` and wait for the next two-second poll. Expected:
+   `Live` is replaced by a green smartphone icon and `1`. The timestamp and
+   green tmux name remain. Tap the row again, return, and poll. Expected: two
+   terminal cards on the same iPhone still produce smartphone count `1`.
+7. Attach from a local laptop shell or an SSH client with
+   `tmux attach-session -t '=pane_title'`. Expected after polling:
+   smartphone `1`, then laptop `1`, in that order. `Live` is absent. Type in
+   the laptop and either Zedra card. Expected: all clients show the same pane
+   input/output.
+8. Detach the laptop client. Expected after polling: the laptop category
+   disappears while smartphone `1` remains. Close one Zedra card. Expected:
+   smartphone stays `1`; the other card, tmux session, and recorded pane PID
+   survive. Close the second card. Expected: the device group disappears and
+   `Live` returns.
+9. Pair an iPad into a different host server session. Attach the iPhone and iPad
+   to `pane_title`, leaving both terminal streams active. Expected on either
+   device after polling: smartphone `1`, then tablet `1`. Attach the laptop
+   client again. Expected: laptop `1` appears third. Counts include the device
+   rendering the list.
+10. Disconnect the iPhone, iPad, and laptop one at a time. Expected: each
+    category disappears on the next poll. After the final detach, only `Live`
+    remains; the custom tmux session and persisted history row remain listed.
+11. Long-press `pane_title`. Expected: medium haptic feedback and the existing
+    native management sheet for the exact tmux name. Cancel once, then repeat,
+    confirm termination, and tap `Terminate`. Expected: only `pane_title` and
+    its matching terminal cards stop; unrelated custom, owned, and historical
+    sessions remain.
+12. Create `race_pi` with the Pi fixture, wait for its row, kill it from another
+    shell, and tap the stale row before the next poll:
 
     ```bash
-    tmux kill-session -t '=cars_us'
-    tmux kill-session -t '=claude_custom'
-    tmux kill-session -t '=mixed_agents'
+    tmux new-session -d -s race_pi "$FIXTURE_DIR/pi"
+    tmux kill-session -t '=race_pi'
+    ```
+
+    Expected: no fallback shell and no temporary terminal card remain. The app
+    returns to the previous/default route and shows `Attach Tmux Session` with
+    the actionable host error.
+13. Repeat the list inspection in light and dark appearance and at the narrowest
+    supported iPhone width. Expected: all semantic greens remain legible. The
+    title and branch truncate first, then the tmux name truncates if required.
+    The `Live` or ordered device-count group stays single-line and visible
+    without horizontal overflow.
+14. Restart the host without stopping tmux. Expected: supported custom sessions
+    are rediscovered with the same titles and metadata. Restart with tmux absent
+    from `PATH`. Expected: only `Tmux sessions` disappears; persisted history and
+    ordinary terminals remain usable. Restore tmux and expected: custom rows
+    return.
+15. Connect the current app to a host from before the custom-tmux RPCs.
+    Expected: the custom section is omitted without hiding persisted history or
+    disabling ordinary terminals and owned shared sessions.
+16. Cleanup against the selected socket:
+
+    ```bash
+    tmux kill-session -t '=exact_history'
+    tmux kill-session -t '=pane_title'
+    tmux kill-session -t '=unnamed'
     tmux kill-session -t '=shell_only'
-    tmux kill-session -t '=zedra-pi-6d616e75616c2d636f6e74726f6c'
+    tmux kill-session -t '=mixed_agents'
     tmux kill-session -t '=zedra-malformed'
     rm -rf "$FIXTURE_DIR"
     ```

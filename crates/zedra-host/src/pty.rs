@@ -2,10 +2,12 @@
 // Uses portable-pty for cross-platform PTY support
 
 use crate::paths;
+#[cfg(windows)]
+use anyhow::Context;
 use anyhow::Result;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
-use zedra_rpc::proto::TerminalColorScheme;
+use zedra_rpc::proto::{TerminalColorScheme, TmuxClientDeviceKind};
 
 pub type PtyParts = (
     Box<dyn Read + Send>,
@@ -52,7 +54,11 @@ pub struct SharedSpawnIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalBacking {
     SharedAgent(SharedSpawnIdentity),
-    ExternalTmux { session_name: String },
+    ExternalTmux {
+        session_name: String,
+        client_pubkey: [u8; 32],
+        device_kind: TmuxClientDeviceKind,
+    },
 }
 
 fn launch_script(launch_cmd: &str) -> String {

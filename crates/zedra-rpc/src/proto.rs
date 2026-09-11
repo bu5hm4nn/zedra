@@ -1640,14 +1640,31 @@ pub struct AgentShareTerminateResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TmuxSessionListReq {}
 
-/// One non-owned tmux session containing at least one registered agent.
+/// One non-owned tmux session containing one registered agent kind.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TmuxSessionSummary {
     /// Byte-exact tmux session name used for later revalidation.
     pub name: String,
-    /// Registered actor slugs detected across the session's live panes,
-    /// deduplicated in pane order.
-    pub agent_slugs: Vec<String>,
+    pub agent_slug: String,
+    pub title: String,
+    pub last_activity_at: Option<DateTime<Utc>>,
+    pub git_branch: Option<String>,
+    pub transcript_size_bytes: Option<u64>,
+    pub clients: TmuxClientCounts,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TmuxClientCounts {
+    pub phone: u32,
+    pub tablet: u32,
+    pub desktop: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TmuxClientDeviceKind {
+    Phone,
+    Tablet,
+    Desktop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1666,6 +1683,7 @@ pub struct TmuxSessionAttachReq {
     pub name: String,
     pub cols: u16,
     pub rows: u16,
+    pub device_kind: TmuxClientDeviceKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2191,7 +2209,16 @@ mod tests {
             version: "3.3a".into(),
             sessions: vec![TmuxSessionSummary {
                 name: "cars us;$(touch nope)".into(),
-                agent_slugs: vec!["pi".into(), "claude".into()],
+                agent_slug: "pi".into(),
+                title: "Review transport".into(),
+                last_activity_at: Some(Utc::now()),
+                git_branch: Some("feat/tmux".into()),
+                transcript_size_bytes: Some(2048),
+                clients: TmuxClientCounts {
+                    phone: 1,
+                    tablet: 2,
+                    desktop: 3,
+                },
             }],
             error: None,
         };
@@ -2203,6 +2230,7 @@ mod tests {
             name: "cars us;$(touch nope)".into(),
             cols: 120,
             rows: 40,
+            device_kind: TmuxClientDeviceKind::Tablet,
         };
         let encoded = postcard::to_allocvec(&attach_req).unwrap();
         let decoded: TmuxSessionAttachReq = postcard::from_bytes(&encoded).unwrap();
@@ -2250,6 +2278,7 @@ mod tests {
             name: "cars_us".into(),
             cols: 120,
             rows: 40,
+            device_kind: TmuxClientDeviceKind::Phone,
         });
         let encoded = postcard::to_allocvec(&attach).unwrap();
         assert_eq!(encoded[0], 57);

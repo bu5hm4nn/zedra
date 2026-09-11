@@ -23,7 +23,7 @@ use uuid::Uuid;
 use zedra_osc::{OscEvent, OscScanner};
 use zedra_rpc::proto::{
     AgentState, BacklogEntry, FsDocsTreeError, FsDocsTreeResult, HostEvent, SessionCloseReason,
-    TermOutput, TermShellState, TerminalSyncEntry,
+    TermOutput, TermShellState, TerminalSyncEntry, TmuxClientCounts, TmuxClientDeviceKind,
 };
 use zedra_rpc::verify_registration_hmac;
 
@@ -576,7 +576,7 @@ impl TermSession {
     pub fn external_tmux_matches(&self, name: &str) -> bool {
         matches!(
             self.backing.as_ref(),
-            Some(TerminalBacking::ExternalTmux { session_name }) if session_name == name
+            Some(TerminalBacking::ExternalTmux { session_name, .. }) if session_name == name
         )
     }
 
@@ -1422,6 +1422,54 @@ impl SessionRegistry {
             verify_registration_hmac(&slot.handshake_secret, client_pubkey, timestamp, hmac)
         })
     }
+    /// Count active Zedra viewers and otherwise-unidentified native tmux clients.
+    pub async fn external_tmux_client_counts(
+        &self,
+        name: &str,
+        session_attached: u32,
+    ) -> TmuxClientCounts {
+        let sessions: Vec<Arc<ServerSession>> =
+            self.sessions.lock().await.values().cloned().collect();
+        let mut host_children = 0u32;
+        let mut active_clients = HashMap::new();
+        for session in sessions {
+            let terminals = session.terminals.lock().await;
+            for terminal in terminals.values() {
+                let Some(TerminalBacking::ExternalTmux {
+                    session_name,
+                    client_pubkey,
+                    device_kind,
+                }) = terminal.backing.as_ref()
+                else {
+                    continue;
+                };
+                if session_name != name {
+                    continue;
+                }
+                host_children = host_children.saturating_add(1);
+                let active = terminal
+                    .output_sender
+                    .lock()
+                    .is_ok_and(|slot| slot.sender.is_some());
+                if active {
+                    active_clients.entry(*client_pubkey).or_insert(*device_kind);
+                }
+            }
+        }
+
+        let mut counts = TmuxClientCounts {
+            desktop: session_attached.saturating_sub(host_children),
+            ..TmuxClientCounts::default()
+        };
+        for device_kind in active_clients.into_values() {
+            match device_kind {
+                TmuxClientDeviceKind::Phone => counts.phone = counts.phone.saturating_add(1),
+                TmuxClientDeviceKind::Tablet => counts.tablet = counts.tablet.saturating_add(1),
+                TmuxClientDeviceKind::Desktop => counts.desktop = counts.desktop.saturating_add(1),
+            }
+        }
+        counts
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2000,7 +2048,32 @@ mod tests {
     fn external_backing(session_name: &str) -> TerminalBacking {
         TerminalBacking::ExternalTmux {
             session_name: session_name.to_string(),
+            client_pubkey: make_pubkey(1),
+            device_kind: TmuxClientDeviceKind::Desktop,
         }
+    }
+
+    fn external_backing_for(
+        session_name: &str,
+        client_pubkey: [u8; 32],
+        device_kind: TmuxClientDeviceKind,
+    ) -> TerminalBacking {
+        TerminalBacking::ExternalTmux {
+            session_name: session_name.to_string(),
+            client_pubkey,
+            device_kind,
+        }
+    }
+
+    fn active_terminal(
+        backing: TerminalBacking,
+    ) -> (TermSession, tokio::sync::mpsc::Receiver<TermOutput>) {
+        let terminal = terminal(Some(backing));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        if let Ok(mut slot) = terminal.output_sender.lock() {
+            slot.sender = Some(sender);
+        }
+        (terminal, receiver)
     }
 
     #[test]
@@ -2061,6 +2134,117 @@ mod tests {
             ]
         );
         for id in ["prefix", "shared", "plain"] {
+            assert!(session.remove_terminal(id).await.unwrap().terminate());
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tmux_presence_deduplicates_devices_across_server_sessions() {
+        let registry = SessionRegistry::new();
+        let first = registry
+            .create_named("presence-a", PathBuf::from("/tmp"))
+            .await;
+        let second = registry
+            .create_named("presence-b", PathBuf::from("/tmp"))
+            .await;
+        let phone_key = make_pubkey(11);
+        let tablet_key = make_pubkey(12);
+        let (phone_a, _phone_a_rx) = active_terminal(external_backing_for(
+            "cars_us",
+            phone_key,
+            TmuxClientDeviceKind::Phone,
+        ));
+        let (phone_b, _phone_b_rx) = active_terminal(external_backing_for(
+            "cars_us",
+            phone_key,
+            TmuxClientDeviceKind::Phone,
+        ));
+        let (tablet, _tablet_rx) = active_terminal(external_backing_for(
+            "cars_us",
+            tablet_key,
+            TmuxClientDeviceKind::Tablet,
+        ));
+        first.insert_terminal("phone-a".into(), phone_a).await;
+        second.insert_terminal("phone-b".into(), phone_b).await;
+        second.insert_terminal("tablet".into(), tablet).await;
+
+        assert_eq!(
+            registry.external_tmux_client_counts("cars_us", 3).await,
+            TmuxClientCounts {
+                phone: 1,
+                tablet: 1,
+                desktop: 0,
+            }
+        );
+        for (session, ids) in [
+            (&first, ["phone-a"].as_slice()),
+            (&second, ["phone-b", "tablet"].as_slice()),
+        ] {
+            for id in ids {
+                assert!(session.remove_terminal(id).await.unwrap().terminate());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tmux_presence_separates_inactive_and_unmanaged_clients() {
+        let registry = SessionRegistry::new();
+        assert_eq!(
+            registry.external_tmux_client_counts("cars_us", 2).await,
+            TmuxClientCounts {
+                phone: 0,
+                tablet: 0,
+                desktop: 2,
+            }
+        );
+
+        let session = registry
+            .create_named("presence-mixed", PathBuf::from("/tmp"))
+            .await;
+        let (phone, _phone_rx) = active_terminal(external_backing_for(
+            "cars_us",
+            make_pubkey(21),
+            TmuxClientDeviceKind::Phone,
+        ));
+        session.insert_terminal("phone".into(), phone).await;
+        session
+            .insert_terminal(
+                "inactive-tablet".into(),
+                terminal(Some(external_backing_for(
+                    "cars_us",
+                    make_pubkey(22),
+                    TmuxClientDeviceKind::Tablet,
+                ))),
+            )
+            .await;
+        session
+            .insert_terminal(
+                "other".into(),
+                terminal(Some(external_backing_for(
+                    "other",
+                    make_pubkey(23),
+                    TmuxClientDeviceKind::Desktop,
+                ))),
+            )
+            .await;
+
+        assert_eq!(
+            registry.external_tmux_client_counts("cars_us", 4).await,
+            TmuxClientCounts {
+                phone: 1,
+                tablet: 0,
+                desktop: 2,
+            }
+        );
+        assert_eq!(
+            registry.external_tmux_client_counts("cars_us", 0).await,
+            TmuxClientCounts {
+                phone: 1,
+                tablet: 0,
+                desktop: 0,
+            }
+        );
+        for id in ["phone", "inactive-tablet", "other"] {
             assert!(session.remove_terminal(id).await.unwrap().terminate());
         }
     }

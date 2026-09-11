@@ -488,27 +488,32 @@ only the configured/default tmux server under the host user:
   version, sessions, error: None }`. Missing, too-old, timed-out, or otherwise
   failing tmux returns `available: false`, an empty `version` and `sessions`,
   and an actionable `error`.
-- Every `TmuxSessionSummary` contains the byte-exact tmux `name` and
-  `agent_slugs`, the distinct registered actor slugs found across live panes in
-  pane order. Every name beginning with the reserved `zedra-` prefix is
-  excluded, including malformed names; those names remain exclusively inside
+- Every `TmuxSessionSummary` contains the byte-exact tmux `name`, one
+  `agent_slug`, a resolved `title`, optional history metadata
+  (`last_activity_at`, `git_branch`, and `transcript_size_bytes`), and categorized
+  active-client counts. Every name beginning with the reserved `zedra-` prefix
+  is excluded, including malformed names; those names remain exclusively inside
   the owned namespace.
-- Actor detection is informational and registry-only. For each live pane the
-  host applies the canonical registry command detector to the nonempty current
-  command, then to the start command only when the current command is
-  unrecognized. Dead panes and unrecognized commands contribute nothing, and a
-  session with no detected registered actor is omitted. Titles, cwd, screen
-  contents, and ad-hoc raw substring matching are never detection inputs.
-  Multiple detected actors are reported without guessing a single identity.
-- `TmuxSessionAttachReq { name, cols, rows }` creates a normal terminal client
-  only after fresh discovery resolves the byte-exact, non-reserved name and
-  still detects at least one registered actor. Tmux receives the exact target
-  form `=<name>`, so spaces and shell metacharacters remain data. If the session
-  disappeared, or still exists but no longer has a detected actor, attachment
-  fails with no terminal and no shell fallback. Multiple terminals may attach
-  independently; ordinary `TermClose` closes only that attach-client PTY and
-  leaves the tmux session running. Success returns `terminal_id`; failures set
-  `error`.
+- Actor detection is registry-only. For each live pane the host applies the
+  canonical registry command detector to the nonempty current command, then to
+  the start command only when the current command is unrecognized. Dead panes
+  and unrecognized commands contribute nothing. Shell-only sessions and sessions
+  containing multiple distinct registered actors are omitted; multiple live
+  panes for one actor produce one row.
+- Cached history metadata is used only when the actor's canonical resume command
+  exactly matches the trimmed tmux pane start command. Otherwise the title is
+  the normalized pane title, falling back to `Unknown`; tmux session activity is
+  used as the timestamp and branch/size remain absent. History cache failures do
+  not hide detected rows.
+- `TmuxSessionAttachReq { name, cols, rows, device_kind }` creates a normal
+  terminal client only after fresh discovery resolves the byte-exact,
+  non-reserved name and still detects one coherent registered actor. Tmux
+  receives the exact target form `=<name>`, so spaces and shell metacharacters
+  remain data. If the session disappeared, or still exists but no longer has a
+  detected actor, attachment fails with no terminal and no shell fallback.
+  Multiple terminals may attach independently; ordinary `TermClose` closes only
+  that attach-client PTY and leaves the tmux session running. Success returns
+  `terminal_id`; failures set `error`.
 - `TmuxSessionTerminateReq { name }` performs the same fresh exact-name,
   reserved-prefix, and registered-actor revalidation before issuing
   `kill-session -t =<name>`. A session that disappeared before termination is
@@ -517,12 +522,12 @@ only the configured/default tmux server under the host user:
   ids in `terminal_ids`. Any other tmux error changes no host terminal state.
   A raw custom name is never routed through `AgentShareTerminate`.
 - Compatibility: `TmuxSessionList`, `TmuxSessionAttach`, and
-  `TmuxSessionTerminate` are appended in that order at the live `ZedraProto`
-  tail without changing the `zedra/rpc/4` ALPN or its frozen predecessor.
-  An older host rejects the unknown discriminant; the client then disables only
-  these three custom-session calls for that connection. The owned
-  `AgentShare*` capability, persisted agent history, and ordinary terminals
-  remain enabled.
+  `TmuxSessionTerminate` were added after `v0.4.4` and remain appended in that
+  order at the live `ZedraProto` tail. Their pre-release payloads may reach this
+  final shape without changing the `zedra/rpc/4` ALPN or frozen v3 protocol:
+  older v4 hosts reject these unknown tail variants before decoding their
+  payloads. The client then disables only these three calls; owned `AgentShare*`,
+  persisted history, and ordinary terminals remain enabled.
 
 ### Async managed-agent fetching
 
@@ -772,6 +777,10 @@ Any protocol-layer change must include all applicable steps:
   only non-`zedra-*` sessions with registry-detected agents, revalidates exact
   names before attach or termination, and distinguishes attach disappearance
   (error) from termination disappearance (already complete).
+- Finalized the unreleased custom-session payloads with one coherent agent,
+  resolved history/display metadata, categorized viewer counts, and attaching
+  device kind. No ALPN bump is needed because `v0.4.4` predates the variants and
+  older v4 hosts reject their unknown tail discriminants before payload decode.
 - On an incompatible response from an older host, the client independently
   disables only these three RPCs; owned shared sessions, agent history, and
   ordinary terminals remain available.

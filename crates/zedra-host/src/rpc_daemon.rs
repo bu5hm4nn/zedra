@@ -3941,7 +3941,7 @@ async fn dispatch(
 
         ZedraMessage::TmuxSessionList(msg) => {
             session.touch().await;
-            let result = tmux_session_list_result().await;
+            let result = tmux_session_list_result(&state, &session, &registry).await;
             let _ = msg.tx.send(result).await;
         }
 
@@ -3951,8 +3951,16 @@ async fn dispatch(
                 .workdir
                 .clone()
                 .or_else(|| Some(state.workdir.clone()));
-            let result =
-                tmux_session_attach_result(&session, workdir, &msg.name, msg.cols, msg.rows).await;
+            let result = tmux_session_attach_result(
+                &session,
+                workdir,
+                &msg.name,
+                msg.cols,
+                msg.rows,
+                client_pubkey,
+                msg.device_kind,
+            )
+            .await;
             if result.error.is_none() {
                 zedra_telemetry::send(Event::HostTerminalOpen {
                     has_launch_cmd: true,
@@ -4226,58 +4234,117 @@ async fn agent_share_terminate_result(
     }
 }
 
-/// List non-owned tmux sessions containing at least one registered agent.
-async fn tmux_session_list_result() -> TmuxSessionListResult {
-    tmux_session_list_result_with(tmux::TmuxClient::discover).await
+/// List non-owned tmux sessions containing one coherent registered agent kind.
+async fn tmux_session_list_result(
+    state: &DaemonState,
+    session: &Arc<ServerSession>,
+    registry: &SessionRegistry,
+) -> TmuxSessionListResult {
+    let (version, detected) = match detected_tmux_sessions_with(tmux::TmuxClient::discover).await {
+        Ok(result) => result,
+        Err(error) => {
+            return TmuxSessionListResult {
+                available: false,
+                version: String::new(),
+                sessions: Vec::new(),
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let mut histories = HashMap::new();
+    for detected_session in &detected {
+        if histories.contains_key(&detected_session.agent_slug) {
+            continue;
+        }
+        let history = agent::list_agent_sessions(
+            &state.agent_cache,
+            &detected_session.agent_slug,
+            &state.workdir,
+            Some(session),
+            0,
+            false,
+        )
+        .await;
+        histories.insert(detected_session.agent_slug.clone(), history);
+    }
+
+    let mut clients = HashMap::new();
+    for detected_session in &detected {
+        clients.insert(
+            detected_session.name.clone(),
+            registry
+                .external_tmux_client_counts(
+                    &detected_session.name,
+                    detected_session.attached_clients,
+                )
+                .await,
+        );
+    }
+    TmuxSessionListResult {
+        available: true,
+        version,
+        sessions: tmux_session_summaries(detected, &histories, &clients),
+        error: None,
+    }
 }
 
-async fn tmux_session_list_result_with<D>(discover: D) -> TmuxSessionListResult
+async fn detected_tmux_sessions_with<D>(
+    discover: D,
+) -> Result<(String, Vec<tmux::DetectedTmuxSession>)>
 where
     D: FnOnce() -> Result<tmux::TmuxClient> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(discover).await {
-        Ok(Ok(client)) => {
-            let version = client.version().to_string();
-            match tokio::task::spawn_blocking(move || client.list_detected_sessions()).await {
-                Ok(Ok(sessions)) => TmuxSessionListResult {
-                    available: true,
-                    version,
-                    sessions: sessions
-                        .into_iter()
-                        .map(|session| TmuxSessionSummary {
-                            name: session.name,
-                            agent_slugs: session.agent_slugs,
-                        })
-                        .collect(),
-                    error: None,
-                },
-                Ok(Err(error)) => TmuxSessionListResult {
-                    available: false,
-                    version: String::new(),
-                    sessions: Vec::new(),
-                    error: Some(error.to_string()),
-                },
-                Err(join) => TmuxSessionListResult {
-                    available: false,
-                    version: String::new(),
-                    sessions: Vec::new(),
-                    error: Some(join.to_string()),
-                },
+    let client = tokio::task::spawn_blocking(discover)
+        .await
+        .map_err(anyhow::Error::from)??;
+    let version = client.version().to_string();
+    let sessions = tokio::task::spawn_blocking(move || client.list_detected_sessions())
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok((version, sessions))
+}
+
+fn tmux_session_summaries(
+    detected: Vec<tmux::DetectedTmuxSession>,
+    histories: &HashMap<String, AgentSessionsResult>,
+    clients: &HashMap<String, TmuxClientCounts>,
+) -> Vec<TmuxSessionSummary> {
+    detected
+        .into_iter()
+        .map(|detected| {
+            let history = histories
+                .get(&detected.agent_slug)
+                .filter(|result| result.error.is_none())
+                .and_then(|result| {
+                    result.sessions.iter().find(|history| {
+                        agent::resume_launch_command(&detected.agent_slug, &history.session_id)
+                            .as_deref()
+                            == Some(detected.start_command.trim())
+                    })
+                });
+            let fallback_title = agent::utils::session_title(Some(detected.pane_title.clone()))
+                .unwrap_or_else(|| "Unknown".to_string());
+            let client_counts = clients.get(&detected.name).copied().unwrap_or_default();
+            TmuxSessionSummary {
+                name: detected.name,
+                agent_slug: detected.agent_slug,
+                title: history
+                    .and_then(|history| agent::utils::session_title(history.title.clone()))
+                    .unwrap_or(fallback_title),
+                last_activity_at: history
+                    .and_then(|history| history.last_activity_at.or(history.created_at))
+                    .or_else(|| {
+                        chrono::DateTime::from_timestamp(detected.activity_unix_seconds, 0)
+                    }),
+                git_branch: history
+                    .and_then(|history| history.git.as_ref())
+                    .and_then(|git| git.branch.clone()),
+                transcript_size_bytes: history.and_then(|history| history.transcript_size_bytes),
+                clients: client_counts,
             }
-        }
-        Ok(Err(error)) => TmuxSessionListResult {
-            available: false,
-            version: String::new(),
-            sessions: Vec::new(),
-            error: Some(error.to_string()),
-        },
-        Err(join) => TmuxSessionListResult {
-            available: false,
-            version: String::new(),
-            sessions: Vec::new(),
-            error: Some(join.to_string()),
-        },
-    }
+        })
+        .collect()
 }
 
 async fn tmux_session_attach_result(
@@ -4286,6 +4353,8 @@ async fn tmux_session_attach_result(
     name: &str,
     cols: u16,
     rows: u16,
+    client_pubkey: [u8; 32],
+    device_kind: TmuxClientDeviceKind,
 ) -> TmuxSessionAttachResult {
     tmux_session_attach_result_with(
         session,
@@ -4293,6 +4362,8 @@ async fn tmux_session_attach_result(
         name,
         cols,
         rows,
+        client_pubkey,
+        device_kind,
         tmux::TmuxClient::discover,
     )
     .await
@@ -4304,6 +4375,8 @@ async fn tmux_session_attach_result_with<D>(
     name: &str,
     cols: u16,
     rows: u16,
+    client_pubkey: [u8; 32],
+    device_kind: TmuxClientDeviceKind,
     discover: D,
 ) -> TmuxSessionAttachResult
 where
@@ -4338,6 +4411,8 @@ where
             identity_launch_cmd,
             backing: Some(TerminalBacking::ExternalTmux {
                 session_name: requested_name,
+                client_pubkey,
+                device_kind,
             }),
         },
     )
@@ -4541,13 +4616,13 @@ mod shared_resume_tests {
     }
 
     #[tokio::test]
-    async fn custom_tmux_list_projects_only_name_and_detected_slugs() {
+    async fn custom_tmux_discovery_omits_multi_agent_sessions_and_surfaces_failures() {
         let stub = stub_tmux(
             "custom-list-handler",
             r#"#!/bin/sh
 case "$1" in
 -V) echo 'tmux 3.5' ;;
-list-sessions) echo 'cars_us' ;;
+list-sessions) echo 'cars_us|0|1726000000' ;;
 list-panes)
   case "$6" in
     *pane_current_command*) printf '%s\n' '%1|pi|0|' '%2|omp|0|' ;;
@@ -4559,29 +4634,122 @@ exit 0
 "#,
         );
         let binary = stub.clone();
-        let result =
-            tmux_session_list_result_with(move || tmux::TmuxClient::with_socket(&binary, None))
-                .await;
-        assert!(result.available);
-        assert_eq!(result.version, "3.5");
-        assert_eq!(
-            result.sessions,
-            [TmuxSessionSummary {
-                name: "cars_us".to_string(),
-                agent_slugs: vec!["pi".to_string(), "omp".to_string()],
-            }]
-        );
-        assert_eq!(result.error, None);
+        let (version, sessions) =
+            detected_tmux_sessions_with(move || tmux::TmuxClient::with_socket(&binary, None))
+                .await
+                .unwrap();
+        assert_eq!(version, "3.5");
+        assert!(sessions.is_empty());
 
-        let unavailable = tmux_session_list_result_with(|| {
+        let unavailable = detected_tmux_sessions_with(|| {
             Err(anyhow::anyhow!("tmux unavailable for handler test"))
         })
-        .await;
-        assert!(!unavailable.available);
-        assert!(unavailable.version.is_empty());
-        assert!(unavailable.sessions.is_empty());
-        assert!(unavailable.error.is_some());
+        .await
+        .unwrap_err();
+        assert!(unavailable
+            .to_string()
+            .contains("tmux unavailable for handler test"));
         let _ = std::fs::remove_file(stub);
+    }
+
+    fn detected_session(title: &str, start_command: &str) -> tmux::DetectedTmuxSession {
+        tmux::DetectedTmuxSession {
+            name: "cars_us".into(),
+            agent_slug: "pi".into(),
+            identity_command: "pi".into(),
+            pane_title: title.into(),
+            current_path: "/tmp".into(),
+            start_command: start_command.into(),
+            attached_clients: 0,
+            activity_unix_seconds: 1_726_000_000,
+        }
+    }
+
+    fn historical_session() -> AgentSessionSummary {
+        AgentSessionSummary {
+            slug: "pi".into(),
+            session_id: "history-1".into(),
+            title: Some("Historical title".into()),
+            cwd: Some("/tmp".into()),
+            created_at: chrono::DateTime::from_timestamp(1_725_000_000, 0),
+            last_activity_at: chrono::DateTime::from_timestamp(1_725_000_100, 0),
+            resume: agent::utils::resume_summary("pi", "history-1"),
+            git: Some(AgentGitSummary {
+                branch: Some("feat/history".into()),
+                worktree: None,
+                commit_hash: None,
+                repository_url: None,
+                pr_number: None,
+                pr_url: None,
+                pr_repository: None,
+            }),
+            usage: None,
+            transcript_size_bytes: Some(4096),
+        }
+    }
+
+    #[test]
+    fn custom_tmux_exact_history_metadata_wins() {
+        let histories = HashMap::from([(
+            "pi".to_string(),
+            AgentSessionsResult {
+                sessions: vec![historical_session()],
+                total: 1,
+                error: None,
+            },
+        )]);
+        let clients = HashMap::from([(
+            "cars_us".to_string(),
+            TmuxClientCounts {
+                phone: 1,
+                tablet: 2,
+                desktop: 3,
+            },
+        )]);
+        let rows = tmux_session_summaries(
+            vec![detected_session("Pane title", "pi --session history-1")],
+            &histories,
+            &clients,
+        );
+        let row = &rows[0];
+        assert_eq!(row.title, "Historical title");
+        assert_eq!(row.git_branch.as_deref(), Some("feat/history"));
+        assert_eq!(row.transcript_size_bytes, Some(4096));
+        assert_eq!(
+            row.last_activity_at,
+            chrono::DateTime::from_timestamp(1_725_000_100, 0)
+        );
+        assert_eq!(row.clients, clients["cars_us"]);
+    }
+
+    #[test]
+    fn custom_tmux_mismatch_and_history_failure_use_pane_fallbacks() {
+        let failed = HashMap::from([(
+            "pi".to_string(),
+            AgentSessionsResult {
+                sessions: vec![historical_session()],
+                total: 1,
+                error: Some("cache unavailable".into()),
+            },
+        )]);
+        let rows = tmux_session_summaries(
+            vec![
+                detected_session("  Pane title  ", "pi"),
+                detected_session("  ", "pi"),
+            ],
+            &failed,
+            &HashMap::new(),
+        );
+        assert_eq!(rows[0].title, "Pane title");
+        assert_eq!(rows[1].title, "Unknown");
+        for row in rows {
+            assert_eq!(
+                row.last_activity_at,
+                chrono::DateTime::from_timestamp(1_726_000_000, 0)
+            );
+            assert_eq!(row.git_branch, None);
+            assert_eq!(row.transcript_size_bytes, None);
+        }
     }
 
     #[tokio::test]
@@ -4747,6 +4915,8 @@ exit 0
             "cars_us",
             80,
             24,
+            [7; 32],
+            TmuxClientDeviceKind::Tablet,
             move || tmux::TmuxClient::with_socket(&attach_binary, None),
         )
         .await;
@@ -4757,8 +4927,13 @@ exit 0
             let terminal = &terminals[&attached.terminal_id];
             assert!(matches!(
                 terminal.backing.as_ref(),
-                Some(TerminalBacking::ExternalTmux { session_name })
-                    if session_name == "cars_us"
+                Some(TerminalBacking::ExternalTmux {
+                    session_name,
+                    client_pubkey,
+                    device_kind,
+                }) if session_name == "cars_us"
+                    && client_pubkey == &[7; 32]
+                    && *device_kind == TmuxClientDeviceKind::Tablet
             ));
             let meta = terminal.host_meta.lock().unwrap();
             assert_eq!(meta.current_command.as_deref(), Some("pi"));
@@ -4770,6 +4945,8 @@ exit 0
                 "other-custom".to_string(),
                 terminal(Some(TerminalBacking::ExternalTmux {
                     session_name: "other".to_string(),
+                    client_pubkey: [8; 32],
+                    device_kind: TmuxClientDeviceKind::Desktop,
                 })),
             )
             .await;
@@ -4810,6 +4987,8 @@ exit 0
                 "external".to_string(),
                 terminal(Some(TerminalBacking::ExternalTmux {
                     session_name: "cars_us".to_string(),
+                    client_pubkey: [9; 32],
+                    device_kind: TmuxClientDeviceKind::Phone,
                 })),
             )
             .await;

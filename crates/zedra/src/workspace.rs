@@ -2818,6 +2818,7 @@ impl Workspace {
         let initial_grid_size = TerminalView::compute_grid_size(window, initial_viewport);
         let cols = initial_grid_size.columns;
         let rows = initial_grid_size.rows;
+        let device_kind = platform_bridge::bridge().tmux_client_device_kind();
         let workspace_terminal =
             self.create_terminal_entity(TERMINAL_PENDING_ID.to_string(), window, cx);
         let pending_entity_id = workspace_terminal.entity_id();
@@ -2841,7 +2842,7 @@ impl Workspace {
 
         cx.spawn(async move |workspace, cx| {
             let terminal_id = match session_handle
-                .tmux_session_attach(name.clone(), cols as u16, rows as u16)
+                .tmux_session_attach(name.clone(), cols as u16, rows as u16, device_kind)
                 .await
             {
                 Ok(id) => id,

@@ -733,7 +733,13 @@ impl SessionHandle {
         }
     }
 
-    pub async fn tmux_session_attach(&self, name: String, cols: u16, rows: u16) -> Result<String> {
+    pub async fn tmux_session_attach(
+        &self,
+        name: String,
+        cols: u16,
+        rows: u16,
+        device_kind: TmuxClientDeviceKind,
+    ) -> Result<String> {
         if !self.tmux_sessions_supported() {
             return Err(anyhow::anyhow!(
                 "custom tmux sessions are unsupported by host"
@@ -743,15 +749,22 @@ impl SessionHandle {
         // Creation and stream attachment must use the same client so clearing
         // the handle during this operation cannot strand a host terminal.
         let client = self.client()?;
-        let result: TmuxSessionAttachResult =
-            match client.rpc(TmuxSessionAttachReq { name, cols, rows }).await {
-                Ok(result) => result,
-                Err(error) => {
-                    let error = map_rpc_error(error);
-                    self.downgrade_tmux_session_rpc(&error.to_string());
-                    return Err(error);
-                }
-            };
+        let result: TmuxSessionAttachResult = match client
+            .rpc(TmuxSessionAttachReq {
+                name,
+                cols,
+                rows,
+                device_kind,
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let error = map_rpc_error(error);
+                self.downgrade_tmux_session_rpc(&error.to_string());
+                return Err(error);
+            }
+        };
         if let Some(error) = result.error {
             return Err(anyhow::anyhow!(error));
         }
@@ -1517,7 +1530,7 @@ mod tmux_session_tests {
             .expect_err("disabled custom tmux list must fail fast");
         assert!(list_error.to_string().contains("unsupported by host"));
         let attach_error = handle
-            .tmux_session_attach("cars_us".into(), 80, 24)
+            .tmux_session_attach("cars_us".into(), 80, 24, TmuxClientDeviceKind::Phone)
             .await
             .expect_err("disabled custom tmux attach must fail fast");
         assert!(attach_error.to_string().contains("unsupported by host"));
@@ -1580,7 +1593,7 @@ mod tmux_session_tests {
         });
 
         let error = handle
-            .tmux_session_attach("cars_us".into(), 80, 24)
+            .tmux_session_attach("cars_us".into(), 80, 24, TmuxClientDeviceKind::Tablet)
             .await
             .expect_err("missing runtime must fail stream attachment");
 
@@ -1628,7 +1641,7 @@ mod tmux_session_tests {
         });
 
         let terminal_id = handle
-            .tmux_session_attach("cars_us".into(), 80, 24)
+            .tmux_session_attach("cars_us".into(), 80, 24, TmuxClientDeviceKind::Desktop)
             .await
             .unwrap();
 
