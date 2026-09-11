@@ -1,6 +1,6 @@
 ---
 title: Configuration
-description: Set daemon defaults once in a YAML config file — relays, telemetry, terminal shell and environment, agents, and update behavior.
+description: Set daemon defaults once in YAML — relays, terminals, agents, tmux, and update behavior.
 ---
 
 Set daemon defaults in a config file instead of passing flags on every `zedra start`. The file is optional; without it, Zedra uses its built-in defaults.
@@ -43,6 +43,8 @@ git:
   untracked: normal
 update:
   restart: ask
+tmux:
+  socket: /home/you/.tmux/zedra.sock
 ```
 
 Restart the daemon to apply changes:
@@ -61,7 +63,7 @@ Zedra reads config from two files:
 - **Global** — `~/.config/zedra/config.yaml` (`%APPDATA%\zedra\config.yaml` on Windows). Defaults for every workspace. Only you can edit it.
 - **Per-workspace** — `.zedra/config.yaml` in the workspace directory you serve. Settings here apply only to that workspace and override the global file. You can commit it to share project defaults with your team.
 
-Because a per-workspace file can arrive with a cloned repository, Zedra ignores the settings that can run code or expose secrets when they appear there — **`terminal.shell`**, **`terminal.env`**, **`terminal.env_passthrough`**, and **`agents.overrides`**. Set those in the global file only; a workspace file that sets them is ignored with a warning in the daemon log. Every other setting works in either file.
+Because a per-workspace file can arrive with a cloned repository, Zedra ignores the settings that can run code, expose secrets, or select a session server when they appear there — **`terminal.shell`**, **`terminal.env`**, **`terminal.env_passthrough`**, **`agents.overrides`**, and **`tmux.socket`**. Set those in the global file only; a workspace file that sets them is ignored with a warning in the daemon log. Every other setting works in either file.
 
 ## Precedence
 
@@ -117,6 +119,10 @@ A flag or environment variable always overrides both files. Each file fills in w
 ## `logging`
 
 - **`level`** — non-`--verbose` log filter: `error` (default), `warn`, `info`, `debug`. `--verbose` and `RUST_LOG` win. Global file only.
+
+## `tmux`
+
+- **`socket`** — absolute path to the tmux server socket used for shared agent sessions. Default: tmux's standard socket, usually under `/tmp`. Set a persistent path when sessions must survive a container restart. Global file only. Every SSH or manual tmux client that shares these sessions must use the same path, for example `tmux -S /home/you/.tmux/zedra.sock list-sessions`.
 
 ## `update`
 

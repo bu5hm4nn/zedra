@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use tracing::*;
 use uuid::Uuid;
-use zedra_rpc::proto::{AgentState, HostInfoSnapshot, WebClientInfo, WebClientUpdate};
+use zedra_rpc::proto::{
+    AgentShareListResult, AgentShareSession, AgentState, HostInfoSnapshot, WebClientInfo,
+    WebClientUpdate,
+};
 
 use zedra_session::*;
 
@@ -177,6 +180,40 @@ fn replace_web_client_cards(cards: &mut Vec<WebClientCard>, clients: Vec<WebClie
     *cards = clients.into_iter().map(web_client_card).collect();
 }
 
+/// Live tmux shared-session snapshot for one agent slug. Runtime-only:
+/// rebuilt from polls while a session view is open, cleared on disconnect.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentSharedSessions {
+    pub slug: String,
+    /// False when the host lacks usable tmux or the agent cannot share
+    /// sessions; `sessions` is then empty and history stays authoritative.
+    pub available: bool,
+    /// Newest tmux pane snapshots. The persisted JSONL rows still decide
+    /// titles, timestamps, and listing order.
+    pub sessions: Vec<AgentShareSession>,
+    /// Some once the current unavailable stretch has been logged, keeping the
+    /// warning to one per episode; reset when shares become available again.
+    logged_unavailable: Option<String>,
+}
+
+/// Entry for `slug`, inserting an empty one when no poll has landed yet.
+fn shared_entry_mut<'a>(
+    entries: &'a mut Vec<AgentSharedSessions>,
+    slug: &str,
+) -> &'a mut AgentSharedSessions {
+    match entries.iter().position(|entry| entry.slug == slug) {
+        Some(index) => &mut entries[index],
+        None => {
+            entries.push(AgentSharedSessions {
+                slug: slug.to_string(),
+                ..Default::default()
+            });
+            let index = entries.len() - 1;
+            &mut entries[index]
+        }
+    }
+}
+
 /// A host-managed agent web-client server (e.g. `opencode serve`) shown as a
 /// card. Runtime-only: rebuilt from the host's `WebClientWatch` stream on every
 /// connect. Icon and display name resolve from `slug`.
@@ -239,6 +276,9 @@ pub struct WorkspaceState {
     // host's `WebClientWatch` stream. Rebuilt per connect, so not persisted.
     #[serde(skip)]
     pub web_clients: Vec<WebClientCard>,
+    // Live tmux shared sessions keyed by agent slug; not persisted.
+    #[serde(skip)]
+    pub shared_sessions: Vec<AgentSharedSessions>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -345,6 +385,7 @@ impl WorkspaceState {
         self.active_main_view = WorkspaceMainView::Default;
         self.main_view_stack.reset(WorkspaceMainView::Default);
         self.terminal_ids.clear();
+        self.shared_sessions.clear();
         self.host_info = None;
         self.web_clients.clear();
     }
@@ -599,6 +640,109 @@ impl WorkspaceState {
     pub fn replace_web_clients(&mut self, clients: Vec<WebClientInfo>, cx: &mut Context<Self>) {
         replace_web_client_cards(&mut self.web_clients, clients);
         cx.notify();
+    }
+
+    /// Apply one `AgentShareList` poll outcome for `slug` (listing or error)
+    /// and log unavailability once per stretch. Returns true when changed.
+    pub fn apply_shared_sessions(
+        &mut self,
+        slug: &str,
+        outcome: Result<&AgentShareListResult, &anyhow::Error>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let changed = self.replace_shared_sessions_snapshot(slug, outcome);
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// Clear every live share after the connection rejects shared-session RPCs.
+    /// Returns true only when consumer-visible snapshot data changed.
+    pub fn clear_shared_session_snapshots(&mut self, cx: &mut Context<Self>) -> bool {
+        let changed = self
+            .shared_sessions
+            .iter()
+            .any(|entry| entry.available || !entry.sessions.is_empty());
+        self.shared_sessions.clear();
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// Drop one live share after explicit termination so its row falls back
+    /// to persisted-history display. Returns true when a snapshot was removed.
+    pub fn remove_shared_session(
+        &mut self,
+        slug: &str,
+        session_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut removed = false;
+        for entry in self
+            .shared_sessions
+            .iter_mut()
+            .filter(|entry| entry.slug == slug)
+        {
+            let before = entry.sessions.len();
+            entry
+                .sessions
+                .retain(|share| share.session_id != session_id);
+            removed |= entry.sessions.len() != before;
+        }
+        if removed {
+            cx.notify();
+        }
+        removed
+    }
+
+    /// Shared-session snapshot for one agent slug, when a poll has landed.
+    pub fn shared_sessions(&self, slug: &str) -> Option<&AgentSharedSessions> {
+        self.shared_sessions.iter().find(|entry| entry.slug == slug)
+    }
+
+    /// Live share for one (slug, session_id); session-card status consumes it.
+    pub fn shared_session(&self, slug: &str, session_id: &str) -> Option<&AgentShareSession> {
+        self.shared_sessions(slug)?
+            .sessions
+            .iter()
+            .find(|share| share.session_id == session_id)
+    }
+
+    fn replace_shared_sessions_snapshot(
+        &mut self,
+        slug: &str,
+        outcome: Result<&AgentShareListResult, &anyhow::Error>,
+    ) -> bool {
+        let (available, sessions, reason) = match outcome {
+            Ok(listing) if listing.available => (true, listing.sessions.clone(), None),
+            Ok(listing) => (
+                false,
+                Vec::new(),
+                Some(
+                    listing
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "host reported shared sessions unavailable".into()),
+                ),
+            ),
+            Err(error) => (false, Vec::new(), Some(format!("{error:#}"))),
+        };
+        let entry = shared_entry_mut(&mut self.shared_sessions, slug);
+        let changed = entry.available != available || entry.sessions != sessions;
+        entry.available = available;
+        entry.sessions = sessions;
+        match &reason {
+            Some(reason) => {
+                if entry.logged_unavailable.is_none() {
+                    entry.logged_unavailable = Some(reason.clone());
+                    warn!(slug, reason = %reason, "shared sessions: live tmux status unavailable");
+                }
+            }
+            None => entry.logged_unavailable = None,
+        }
+        changed
     }
 
     /// Forget a tracked web tunnel (user removed it from the list).
@@ -980,6 +1124,34 @@ mod tests {
                 state: AgentState::Running,
                 path: "/session/1".into(),
             }],
+            shared_sessions: vec![
+                AgentSharedSessions {
+                    slug: "pi".into(),
+                    available: true,
+                    sessions: vec![AgentShareSession {
+                        session_id: "same-id".into(),
+                        title: None,
+                        cwd: None,
+                        current_command: None,
+                        dead: false,
+                        exit_code: None,
+                    }],
+                    logged_unavailable: None,
+                },
+                AgentSharedSessions {
+                    slug: "omp".into(),
+                    available: true,
+                    sessions: vec![AgentShareSession {
+                        session_id: "same-id".into(),
+                        title: None,
+                        cwd: None,
+                        current_command: None,
+                        dead: false,
+                        exit_code: None,
+                    }],
+                    logged_unavailable: None,
+                },
+            ],
             ..Default::default()
         };
 
@@ -994,6 +1166,108 @@ mod tests {
         assert!(state.terminal_ids.is_empty());
         assert_eq!(state.host_info, None);
         assert!(state.web_clients.is_empty());
+        assert!(state.shared_sessions.is_empty());
+    }
+
+    #[test]
+    fn shared_session_polls_replace_snapshot_and_warn_once_per_stretch() {
+        use gpui::{AppContext as _, TestAppContext};
+
+        let live = AgentShareListResult {
+            available: true,
+            version: "3.3a".into(),
+            sessions: vec![AgentShareSession {
+                session_id: "same-id".into(),
+                title: Some("t".into()),
+                cwd: None,
+                current_command: None,
+                dead: false,
+                exit_code: None,
+            }],
+            error: None,
+        };
+        let unavailable = AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some("no usable tmux".into()),
+        };
+
+        let mut cx = TestAppContext::single();
+        let state = cx.update(|cx| cx.new(|_cx| WorkspaceState::default()));
+
+        assert!(
+            state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "pi",
+                Ok(&live),
+                cx
+            ))
+        );
+        assert!(
+            state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "omp",
+                Ok(&live),
+                cx
+            ))
+        );
+        assert!(state.update(&mut cx, |state, _| {
+            state.shared_session("pi", "same-id").is_some()
+                && state.shared_session("omp", "same-id").is_some()
+        }));
+        // The identical snapshot again: no change, no observers notified.
+        assert!(
+            !state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "pi",
+                Ok(&live),
+                cx
+            ))
+        );
+
+        // Infrastructure failure clears only that actor and records one
+        // warning guard for the unavailable stretch.
+        assert!(
+            state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "pi",
+                Ok(&unavailable),
+                cx
+            ))
+        );
+        let entry = state.update(&mut cx, |state, _| {
+            state.shared_sessions("pi").unwrap().clone()
+        });
+        assert!(!entry.available);
+        assert!(entry.sessions.is_empty());
+        assert_eq!(entry.logged_unavailable.as_deref(), Some("no usable tmux"));
+        assert!(
+            !state.update(&mut cx, |state, cx| state.apply_shared_sessions(
+                "pi",
+                Ok(&unavailable),
+                cx
+            ))
+        );
+        assert!(state.update(&mut cx, |state, _| {
+            state.shared_session("omp", "same-id").is_some()
+        }));
+
+        // Same ids in different namespaces are removed independently.
+        assert!(state.update(&mut cx, |state, cx| {
+            state.apply_shared_sessions("pi", Ok(&live), cx)
+        }));
+        assert!(state.update(&mut cx, |state, cx| {
+            state.remove_shared_session("pi", "same-id", cx)
+        }));
+        assert!(state.update(&mut cx, |state, _| {
+            state.shared_session("pi", "same-id").is_none()
+                && state.shared_session("omp", "same-id").is_some()
+        }));
+
+        assert!(state.update(&mut cx, |state, cx| {
+            state.apply_shared_sessions("pi", Ok(&live), cx)
+        }));
+        assert!(state.update(&mut cx, |state, cx| {
+            state.clear_shared_session_snapshots(cx)
+        }));
+        assert!(state.update(&mut cx, |state, _| state.shared_sessions.is_empty()));
     }
 
     #[test]

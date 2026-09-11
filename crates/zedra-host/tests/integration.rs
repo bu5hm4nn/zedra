@@ -988,3 +988,946 @@ async fn opencode_web_client_shares_one_server_per_card() {
 
     std::fs::remove_dir_all(&workdir).ok();
 }
+// ---------------------------------------------------------------------------
+// Real tmux: shared Pi and OMP session lifecycle. Ignored by default — needs
+// tmux >= 3.3a on PATH and runs throwaway sessions on a private `-L` socket, so
+// the developer's own tmux server is never touched.
+// Run with: cargo test -p zedra-host --test integration tmux_shared_agent_session_lifecycle -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod tmux_lifecycle {
+    use super::*;
+    use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+    use std::ffi::{OsStr, OsString};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+    use zedra_host::pty::{SharedSpawnIdentity, SpawnOptions, TerminalBacking};
+    use zedra_host::rpc_daemon::create_terminal;
+    use zedra_host::tmux::{self, TmuxClient};
+
+    /// Best-effort cleanup for the private socket: kill only this test's
+    /// server. Never a pattern kill — that would hit unrelated tmux state.
+    struct PrivateSocket {
+        name: String,
+    }
+
+    impl Drop for PrivateSocket {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.name, "kill-server"])
+                .output();
+        }
+    }
+
+    /// A tmux client attached through the production attach command. The child
+    /// is `sh -c <command>` and the command `exec`s tmux, so the child process
+    /// is the tmux client itself and its exit status is tmux's own.
+    struct AttachedClient {
+        _master: Box<dyn MasterPty + Send>,
+        child: Box<dyn Child + Send + Sync>,
+        writer: Box<dyn Write + Send>,
+        output: mpsc::Receiver<String>,
+        seen: String,
+    }
+
+    impl AttachedClient {
+        fn spawn(attach_command: &str, cols: u16, rows: u16) -> Self {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("open pty for tmux client");
+            // tmux clients need a usable TERM or they refuse to attach.
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.arg("-c");
+            command.arg(attach_command);
+            command.env("TERM", "xterm-256color");
+            let child = pair
+                .slave
+                .spawn_command(command)
+                .expect("spawn tmux client");
+            drop(pair.slave);
+            let writer = pair.master.take_writer().expect("take client writer");
+            let reader = pair.master.try_clone_reader().expect("take client reader");
+            let (sender, output) = mpsc::channel();
+            thread::spawn(move || {
+                let mut reader = reader;
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            // The receiver lives as long as the client; a
+                            // failed send only means the test already moved on.
+                            let _ = sender.send(String::from_utf8_lossy(&buffer[..n]).into_owned());
+                        }
+                    }
+                }
+            });
+            Self {
+                _master: pair.master,
+                child,
+                writer,
+                output,
+                seen: String::new(),
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.process_id().expect("tmux client has a pid")
+        }
+
+        fn send(&mut self, line: &str) {
+            self.writer
+                .write_all(line.as_bytes())
+                .and_then(|()| self.writer.flush())
+                .expect("write to tmux client");
+        }
+
+        /// Drain the reader thread and report whether `pattern` has arrived.
+        fn received(&mut self, pattern: &str) -> bool {
+            while let Ok(chunk) = self.output.try_recv() {
+                self.seen.push_str(&chunk);
+            }
+            self.seen.contains(pattern)
+        }
+
+        fn exited(&mut self) -> bool {
+            self.child.try_wait().expect("poll tmux client").is_some()
+        }
+    }
+
+    impl Drop for AttachedClient {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+        }
+    }
+
+    fn tmux_output(socket: &str, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("tmux")
+            .args(["-L", socket])
+            .args(args)
+            .output()
+            .expect("spawn tmux")
+    }
+
+    fn tmux_text(socket: &str, args: &[&str]) -> String {
+        let output = tmux_output(socket, args);
+        assert!(
+            output.status.success(),
+            "tmux {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Poll `condition` for up to five seconds; the final check is authoritative.
+    fn wait_for(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return condition();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// (pane pid, pane dead) of the session's single pane.
+    fn pane_state(socket: &str, name: &str) -> Option<(u32, bool)> {
+        let line = tmux_text(
+            socket,
+            &["list-panes", "-t", name, "-F", "#{pane_pid}|#{pane_dead}"],
+        );
+        let (pid, dead) = line.lines().next()?.split_once('|')?;
+        Some((pid.parse().ok()?, dead == "1"))
+    }
+
+    fn client_count(socket: &str, name: &str) -> usize {
+        tmux_text(
+            socket,
+            &["list-clients", "-t", name, "-F", "#{client_name}"],
+        )
+        .lines()
+        .count()
+    }
+
+    /// Live pane size as `WxH`, from the session's display message.
+    fn pane_size(socket: &str, name: &str) -> String {
+        let format = "#{pane_width}x#{pane_height}";
+        tmux_text(socket, &["display-message", "-p", "-t", name, "-F", format])
+            .trim()
+            .to_string()
+    }
+
+    /// The client name owning `pid`, from the client list itself. Names are
+    /// release-dependent; the pid column is not.
+    fn client_name_by_pid(socket: &str, name: &str, pid: u32) -> Option<String> {
+        let format = "#{client_pid}|#{client_name}";
+        tmux_text(socket, &["list-clients", "-t", name, "-F", format])
+            .lines()
+            .find_map(|line| {
+                let (client_pid, client_name) = line.split_once('|')?;
+                (client_pid == pid.to_string()).then(|| client_name.to_string())
+            })
+    }
+
+    #[test]
+    #[ignore = "needs tmux >= 3.3a on PATH; creates throwaway sessions on a private socket"]
+    fn tmux_shared_agent_session_lifecycle() {
+        let Ok(probe) = std::process::Command::new("tmux").arg("-V").output() else {
+            eprintln!("skipping tmux_shared_agent_session_lifecycle: no tmux binary on PATH");
+            return;
+        };
+        let version = match tmux::supported_version(&String::from_utf8_lossy(&probe.stdout)) {
+            Ok(version) => version,
+            Err(reason) => {
+                eprintln!("skipping tmux_shared_agent_session_lifecycle: {reason}");
+                return;
+            }
+        };
+        eprintln!("tmux_shared_agent_session_lifecycle against tmux {version}");
+
+        let socket = PrivateSocket {
+            name: format!("zedra-it-{}", std::process::id()),
+        };
+        let client = TmuxClient::with_socket("tmux", Some(&socket.name)).expect("tmux client");
+        let workdir = tempfile::tempdir().expect("temp workdir");
+        std::fs::create_dir(workdir.path().join("elsewhere")).expect("create move target");
+        let elsewhere =
+            std::fs::canonicalize(workdir.path().join("elsewhere")).expect("canonical target");
+        let session_id = format!("lifecycle-{}", std::process::id());
+        let pi_name = tmux::owned_session_name("pi", &session_id).expect("Pi owned name");
+        let omp_name = tmux::owned_session_name("omp", &session_id).expect("OMP owned name");
+        assert_ne!(pi_name, omp_name);
+        assert_eq!(
+            tmux::session_ownership(&pi_name),
+            tmux::SessionOwnership::Owned {
+                slug: "pi".to_string(),
+                session_id: session_id.clone(),
+            }
+        );
+        assert_eq!(
+            tmux::session_ownership(&omp_name),
+            tmux::SessionOwnership::Owned {
+                slug: "omp".to_string(),
+                session_id: session_id.clone(),
+            }
+        );
+
+        // Concurrent create-or-attach races start exactly one Pi process.
+        let pi_attach_commands: Vec<String> = thread::scope(|scope| {
+            let session_id = &session_id;
+            let workdir = workdir.path();
+            let racers: Vec<_> = (0..8)
+                .map(|_| {
+                    let client = client.clone();
+                    scope.spawn(move || {
+                        client
+                            .prepare_session("pi", session_id, workdir, "sh")
+                            .expect("concurrent prepare must succeed")
+                    })
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|racer| racer.join().expect("prepare thread"))
+                .collect()
+        });
+        assert!(
+            pi_attach_commands
+                .iter()
+                .all(|command| command == &pi_attach_commands[0]),
+            "racers disagree on the attach command: {pi_attach_commands:?}"
+        );
+        let omp_attach_command = client
+            .prepare_session("omp", &session_id, workdir.path(), "sh")
+            .expect("prepare OMP session");
+
+        let (pi_pane_pid, pi_dead) =
+            pane_state(&socket.name, &pi_name).expect("Pi pane after the race");
+        let (omp_pane_pid, omp_dead) =
+            pane_state(&socket.name, &omp_name).expect("OMP pane after prepare");
+        assert!(!pi_dead && process_exists(pi_pane_pid));
+        assert!(!omp_dead && process_exists(omp_pane_pid));
+
+        // A foreign session stays invisible, and each owned listing is isolated
+        // by slug even though Pi and OMP use the same provider session id.
+        tmux_text(
+            &socket.name,
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                "foreign-lifecycle",
+                "-c",
+                workdir.path().to_str().expect("UTF-8 workdir"),
+                "sh",
+            ],
+        );
+        let pi_panes = client.list_sessions("pi").expect("list Pi sessions");
+        let omp_panes = client.list_sessions("omp").expect("list OMP sessions");
+        assert_eq!(pi_panes.len(), 1);
+        assert_eq!(omp_panes.len(), 1);
+        assert_eq!(pi_panes[0].slug, "pi");
+        assert_eq!(omp_panes[0].slug, "omp");
+        assert_eq!(pi_panes[0].session_id, session_id);
+        assert_eq!(omp_panes[0].session_id, session_id);
+        assert!(!pi_panes[0].process.dead);
+        assert!(!omp_panes[0].process.dead);
+        assert!(!pi_panes[0].process.current_command.is_empty());
+        assert!(!omp_panes[0].process.current_command.is_empty());
+        assert_eq!(pi_panes[0].metadata.start_command, "sh");
+        assert_eq!(omp_panes[0].metadata.start_command, "sh");
+        let mut listed_pi = || client.list_sessions("pi").unwrap_or_default();
+        let mut listed_omp = || client.list_sessions("omp").unwrap_or_default();
+
+        // Two independent clients attach to each provider target.
+        let mut pi_desktop = AttachedClient::spawn(&pi_attach_commands[0], 100, 30);
+        let mut pi_phone = AttachedClient::spawn(&pi_attach_commands[0], 40, 12);
+        let mut omp_desktop = AttachedClient::spawn(&omp_attach_command, 90, 26);
+        let mut omp_phone = AttachedClient::spawn(&omp_attach_command, 35, 10);
+        assert!(wait_for(|| client_count(&socket.name, &pi_name) == 2));
+        assert!(wait_for(|| client_count(&socket.name, &omp_name) == 2));
+        for name in [&pi_name, &omp_name] {
+            assert_eq!(
+                tmux_text(&socket.name, &["show-options", "-v", "-t", name, "mouse"]).trim(),
+                "on"
+            );
+        }
+        assert!(
+            wait_for(|| pane_size(&socket.name, &pi_name) == "100x29"),
+            "Pi pane sizes to the largest client"
+        );
+
+        pi_desktop.send("echo pi-desktop-only\n");
+        pi_phone.send("echo pi-phone-only\n");
+        assert!(wait_for(|| {
+            pi_desktop.received("pi-desktop-only")
+                && pi_desktop.received("pi-phone-only")
+                && pi_phone.received("pi-desktop-only")
+                && pi_phone.received("pi-phone-only")
+        }));
+        assert!(!omp_desktop.received("pi-desktop-only"));
+        assert!(!omp_phone.received("pi-phone-only"));
+
+        omp_desktop.send("echo omp-desktop-only\n");
+        omp_phone.send("echo omp-phone-only\n");
+        assert!(wait_for(|| {
+            omp_desktop.received("omp-desktop-only")
+                && omp_desktop.received("omp-phone-only")
+                && omp_phone.received("omp-desktop-only")
+                && omp_phone.received("omp-phone-only")
+        }));
+        assert!(!pi_desktop.received("omp-desktop-only"));
+        assert!(!pi_phone.received("omp-phone-only"));
+
+        // Metadata follows each inner process independently.
+        pi_desktop.send("printf '\\033]0;pi-title\\007'\n");
+        omp_desktop.send("printf '\\033]0;omp-title\\007'\n");
+        assert!(wait_for(|| listed_pi()
+            .first()
+            .is_some_and(|pane| pane.metadata.title == "pi-title")));
+        assert!(wait_for(|| listed_omp()
+            .first()
+            .is_some_and(|pane| pane.metadata.title == "omp-title")));
+        pi_phone.send("cd elsewhere\n");
+        let target = elsewhere.to_str().expect("UTF-8 cwd").to_string();
+        assert!(wait_for(|| listed_pi()
+            .first()
+            .is_some_and(|pane| pane.metadata.current_path == target)));
+        assert_ne!(listed_omp()[0].metadata.current_path, target);
+
+        // Detaching one client from either target leaves both inner processes
+        // and each provider's other client intact.
+        for (name, attached) in [(&pi_name, &pi_phone), (&omp_name, &omp_phone)] {
+            let client_name = client_name_by_pid(&socket.name, name, attached.pid())
+                .expect("attached client is listed");
+            let detach = tmux_output(&socket.name, &["detach-client", "-t", &client_name]);
+            assert!(
+                detach.status.success(),
+                "detach failed: {}",
+                String::from_utf8_lossy(&detach.stderr)
+            );
+        }
+        assert!(wait_for(|| pi_phone.exited() && omp_phone.exited()));
+        assert!(wait_for(|| client_count(&socket.name, &pi_name) == 1));
+        assert!(wait_for(|| client_count(&socket.name, &omp_name) == 1));
+        assert!(process_exists(pi_pane_pid));
+        assert!(process_exists(omp_pane_pid));
+
+        pi_desktop.send("echo pi-after-detach\n");
+        omp_desktop.send("echo omp-after-detach\n");
+        assert!(wait_for(|| pi_desktop.received("pi-after-detach")));
+        assert!(wait_for(|| omp_desktop.received("omp-after-detach")));
+
+        let mut pi_second = AttachedClient::spawn(&pi_attach_commands[0], 90, 26);
+        let mut omp_second = AttachedClient::spawn(&omp_attach_command, 80, 24);
+        assert!(wait_for(|| client_count(&socket.name, &pi_name) == 2));
+        assert!(wait_for(|| client_count(&socket.name, &omp_name) == 2));
+
+        // Terminating OMP ends only OMP; Pi remains live and attachable.
+        client
+            .terminate_session("omp", &session_id)
+            .expect("terminate OMP");
+        assert!(wait_for(|| !process_exists(omp_pane_pid)));
+        assert!(wait_for(|| omp_desktop.exited() && omp_second.exited()));
+        assert!(process_exists(pi_pane_pid));
+        assert_eq!(client.list_sessions("pi").expect("list Pi").len(), 1);
+        assert!(client
+            .list_sessions("omp")
+            .expect("list terminated OMP")
+            .is_empty());
+        pi_desktop.send("echo pi-after-omp-terminate\n");
+        assert!(wait_for(|| pi_second.received("pi-after-omp-terminate")));
+
+        client
+            .terminate_session("pi", &session_id)
+            .expect("terminate Pi");
+        assert!(wait_for(|| !process_exists(pi_pane_pid)));
+        assert!(wait_for(|| pi_desktop.exited() && pi_second.exited()));
+        assert!(client
+            .list_sessions("pi")
+            .expect("list terminated Pi")
+            .is_empty());
+        assert!(client.list_sessions("omp").expect("list OMP").is_empty());
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn write_agent_fixture(bin_dir: &Path, slug: &str) {
+        let path = bin_dir.join(slug);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf 'fixture:{slug}:ready\\r\\n'\nwhile IFS= read -r line; do\n  printf 'fixture:{slug}:%s\\r\\n' \"$line\"\ndone\n"
+            ),
+        )
+        .expect("write blocking agent fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make agent fixture executable");
+    }
+
+    fn new_fixture_session(socket: &str, name: &str, cwd: &Path, command: &str) {
+        tmux_text(
+            socket,
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-c",
+                cwd.to_str().expect("UTF-8 fixture workdir"),
+                command,
+            ],
+        );
+    }
+
+    fn exact_client_count(socket: &str, name: &str) -> usize {
+        let target = format!("={name}");
+        tmux_text(
+            socket,
+            &["list-clients", "-t", &target, "-F", "#{client_name}"],
+        )
+        .lines()
+        .count()
+    }
+
+    fn exact_session_exists(socket: &str, name: &str) -> bool {
+        let target = format!("={name}");
+        tmux_output(socket, &["has-session", "-t", &target])
+            .status
+            .success()
+    }
+
+    macro_rules! assert_terminal_output {
+        ($receiver:ident, $needle:expr) => {{
+            let needle = $needle;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen = String::new();
+            loop {
+                let now = Instant::now();
+                assert!(
+                    now < deadline,
+                    "terminal output did not contain {needle:?}: {seen:?}"
+                );
+                let output = tokio::time::timeout(deadline - now, $receiver.recv())
+                    .await
+                    .expect("timed out waiting for terminal output");
+                match output {
+                    Ok(Some(output)) => {
+                        seen.push_str(&String::from_utf8_lossy(&output.data));
+                        if seen.contains(needle) {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        panic!("terminal output closed before {needle:?} arrived: {seen:?}")
+                    }
+                    Err(error) => {
+                        panic!("terminal output failed before {needle:?} arrived: {error}")
+                    }
+                }
+            }
+        }};
+    }
+
+    async fn attach_custom_session(client: &irpc::Client<ZedraProto>, name: &str) -> String {
+        let result: TmuxSessionAttachResult = client
+            .rpc(TmuxSessionAttachReq {
+                name: name.to_string(),
+                cols: 80,
+                rows: 24,
+                device_kind: TmuxClientDeviceKind::Desktop,
+            })
+            .await
+            .expect("attach custom tmux RPC");
+        assert!(
+            result.error.is_none(),
+            "attach {name:?} failed: {:?}",
+            result.error
+        );
+        assert!(
+            uuid::Uuid::parse_str(&result.terminal_id).is_ok(),
+            "host returned a non-UUID terminal id: {:?}",
+            result.terminal_id
+        );
+        result.terminal_id
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs tmux >= 3.3a on PATH; creates agent fixtures and throwaway sessions on a private socket"]
+    async fn tmux_custom_agent_session_lifecycle() {
+        let Ok(probe) = std::process::Command::new("tmux").arg("-V").output() else {
+            eprintln!("skipping tmux_custom_agent_session_lifecycle: no tmux binary on PATH");
+            return;
+        };
+        let version = match tmux::supported_version(&String::from_utf8_lossy(&probe.stdout)) {
+            Ok(version) => version,
+            Err(reason) => {
+                eprintln!("skipping tmux_custom_agent_session_lifecycle: {reason}");
+                return;
+            }
+        };
+        eprintln!("tmux_custom_agent_session_lifecycle against tmux {version}");
+
+        let environment = tempfile::tempdir().expect("temp fixture environment");
+        let fixture_bin = environment.path().join("bin");
+        let test_home = environment.path().join("home");
+        std::fs::create_dir_all(&fixture_bin).expect("create fixture bin");
+        std::fs::create_dir_all(&test_home).expect("create fixture home");
+        for slug in ["pi", "omp", "claude"] {
+            write_agent_fixture(&fixture_bin, slug);
+        }
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let fixture_path = std::env::join_paths(
+            std::iter::once(fixture_bin.clone()).chain(std::env::split_paths(&original_path)),
+        )
+        .expect("compose fixture PATH");
+        let _home_guard = EnvVarGuard::set("HOME", &test_home);
+        let _path_guard = EnvVarGuard::set("PATH", &fixture_path);
+        let socket = PrivateSocket {
+            name: format!(
+                "zedra-custom-it-{}-{:x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ),
+        };
+        let tmux_client =
+            TmuxClient::with_socket("tmux", Some(&socket.name)).expect("private tmux client");
+
+        let cars_name = "cars_us";
+        let claude_name = "claude_custom";
+        let multi_name = "pi_omp_multi";
+        let shell_name = "shell_only";
+        let metachar_name = "meta; touch TMUX_COMMAND_INJECTION";
+        let owned_session_id = format!("custom-control-{}", std::process::id());
+        let owned_name =
+            tmux::owned_session_name("pi", &owned_session_id).expect("owned control name");
+
+        new_fixture_session(&socket.name, cars_name, environment.path(), "pi");
+        new_fixture_session(&socket.name, claude_name, environment.path(), "claude");
+        new_fixture_session(&socket.name, multi_name, environment.path(), "pi");
+        let multi_target = format!("={multi_name}:");
+        for command in ["omp", "pi"] {
+            tmux_text(
+                &socket.name,
+                &[
+                    "split-window",
+                    "-d",
+                    "-t",
+                    &multi_target,
+                    "-c",
+                    environment.path().to_str().expect("UTF-8 fixture workdir"),
+                    command,
+                ],
+            );
+        }
+        new_fixture_session(&socket.name, shell_name, environment.path(), "sh");
+        new_fixture_session(&socket.name, &owned_name, environment.path(), "pi");
+        new_fixture_session(&socket.name, metachar_name, environment.path(), "claude");
+
+        let socket_path = tmux_text(
+            &socket.name,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                cars_name,
+                "-F",
+                "#{socket_path}",
+            ],
+        );
+        let socket_path = std::path::PathBuf::from(socket_path.trim());
+        assert!(
+            socket_path.is_absolute(),
+            "tmux returned a relative socket path"
+        );
+        let config_dir = test_home.join(".config").join("zedra");
+        std::fs::create_dir_all(&config_dir).expect("create private global config directory");
+        let socket_yaml =
+            serde_json::to_string(socket_path.to_str().expect("UTF-8 private socket path"))
+                .expect("quote private socket path");
+        std::fs::write(
+            config_dir.join(zedra_host::global_config::FILE_NAME),
+            format!("tmux:\n  socket: {socket_yaml}\n"),
+        )
+        .expect("write private tmux config");
+        zedra_host::global_config::init(environment.path());
+        if zedra_host::global_config::get().tmux.socket.as_deref() != Some(socket_path.as_path()) {
+            eprintln!(
+                "skipping tmux_custom_agent_session_lifecycle: global config was initialized by another ignored test"
+            );
+            return;
+        }
+
+        let (_relay, relay_url) = spawn_test_relay().await.expect("start private relay");
+        let (host_ep, registry, identity, host_workdir) =
+            setup_host(relay_url.clone()).await.expect("start host");
+        let (rpc, session_id, _client_pubkey, _sync) =
+            connect_client(relay_url, &host_ep, &registry, &identity)
+                .await
+                .expect("connect authenticated client");
+        let server_session = registry.get(&session_id).await.expect("server session");
+        let injection_sentinel = host_workdir.path().join("TMUX_COMMAND_INJECTION");
+
+        let listed: TmuxSessionListResult = rpc
+            .rpc(TmuxSessionListReq {})
+            .await
+            .expect("list custom tmux sessions");
+        assert!(listed.available, "tmux unavailable: {:?}", listed.error);
+        assert_eq!(listed.version, version.to_string());
+        assert!(listed.error.is_none());
+        let supported_names = [cars_name, claude_name, metachar_name];
+        let enumerated_names = tmux_text(&socket.name, &["list-sessions", "-F", "#{session_name}"]);
+        let expected_custom_order: Vec<&str> = enumerated_names
+            .lines()
+            .filter(|name| supported_names.contains(name))
+            .collect();
+        assert_eq!(
+            listed
+                .sessions
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            expected_custom_order,
+            "custom discovery must preserve tmux enumeration order"
+        );
+        assert_eq!(listed.sessions.len(), supported_names.len());
+        for (name, expected_slug) in [
+            (cars_name, "pi"),
+            (claude_name, "claude"),
+            (metachar_name, "claude"),
+        ] {
+            let session = listed
+                .sessions
+                .iter()
+                .find(|session| session.name == name)
+                .unwrap_or_else(|| panic!("custom discovery omitted {name:?}"));
+            assert_eq!(
+                session.agent_slug, expected_slug,
+                "wrong detected actor for {name:?}"
+            );
+        }
+        assert!(
+            !listed.sessions.iter().any(|session| {
+                session.name == shell_name
+                    || session.name == owned_name
+                    || session.name == multi_name
+            }),
+            "shell-only, owned, and multi-agent sessions must stay outside custom discovery"
+        );
+
+        let cars_one_id = attach_custom_session(&rpc, cars_name).await;
+        let cars_two_id = attach_custom_session(&rpc, cars_name).await;
+        assert_ne!(cars_one_id, cars_two_id);
+        let (cars_one_input, mut cars_one_output) = rpc
+            .bidi_streaming::<TermAttachReq, TermInput, TermOutput>(
+                TermAttachReq {
+                    id: cars_one_id.clone(),
+                    last_seq: 0,
+                },
+                256,
+                256,
+            )
+            .await
+            .expect("attach first cars terminal stream");
+        let (cars_two_input, mut cars_two_output) = rpc
+            .bidi_streaming::<TermAttachReq, TermInput, TermOutput>(
+                TermAttachReq {
+                    id: cars_two_id.clone(),
+                    last_seq: 0,
+                },
+                256,
+                256,
+            )
+            .await
+            .expect("attach second cars terminal stream");
+        assert!(wait_for(|| exact_client_count(&socket.name, cars_name) == 2));
+        let (cars_pane_pid, cars_dead) =
+            pane_state(&socket.name, cars_name).expect("cars pane state");
+        assert!(!cars_dead && process_exists(cars_pane_pid));
+
+        cars_one_input
+            .send(TermInput {
+                data: b"cars-from-one\n".to_vec(),
+            })
+            .await
+            .expect("write first cars terminal");
+        assert_terminal_output!(cars_one_output, "fixture:pi:cars-from-one");
+        assert_terminal_output!(cars_two_output, "fixture:pi:cars-from-one");
+        cars_two_input
+            .send(TermInput {
+                data: b"cars-from-two\n".to_vec(),
+            })
+            .await
+            .expect("write second cars terminal");
+        assert_terminal_output!(cars_one_output, "fixture:pi:cars-from-two");
+        assert_terminal_output!(cars_two_output, "fixture:pi:cars-from-two");
+
+        let closed: TermCloseResult = rpc
+            .rpc(TermCloseReq {
+                id: cars_one_id.clone(),
+            })
+            .await
+            .expect("close first cars terminal card");
+        assert!(closed.ok);
+        assert!(wait_for(|| exact_client_count(&socket.name, cars_name) == 1));
+        assert!(exact_session_exists(&socket.name, cars_name));
+        assert!(process_exists(cars_pane_pid));
+        {
+            let terminals = server_session.terminals.lock().await;
+            assert!(!terminals.contains_key(&cars_one_id));
+            assert!(terminals.contains_key(&cars_two_id));
+        }
+        cars_two_input
+            .send(TermInput {
+                data: b"cars-after-close\n".to_vec(),
+            })
+            .await
+            .expect("write surviving cars terminal");
+        assert_terminal_output!(cars_two_output, "fixture:pi:cars-after-close");
+
+        let claude_id = attach_custom_session(&rpc, claude_name).await;
+        let (claude_input, mut claude_output) = rpc
+            .bidi_streaming::<TermAttachReq, TermInput, TermOutput>(
+                TermAttachReq {
+                    id: claude_id.clone(),
+                    last_seq: 0,
+                },
+                256,
+                256,
+            )
+            .await
+            .expect("attach Claude terminal stream");
+        let (claude_pane_pid, claude_dead) =
+            pane_state(&socket.name, claude_name).expect("Claude pane state");
+        assert!(!claude_dead && process_exists(claude_pane_pid));
+
+        let owned_attach_command = tmux_client.attach_command(&owned_name);
+        let owned_id = create_terminal(
+            &server_session,
+            80,
+            24,
+            SpawnOptions {
+                workdir: Some(host_workdir.path().to_path_buf()),
+                launch_cmd: Some(owned_attach_command),
+                identity_launch_cmd: Some("pi".to_string()),
+                backing: Some(TerminalBacking::SharedAgent(SharedSpawnIdentity {
+                    slug: "pi".to_string(),
+                    session_id: owned_session_id.clone(),
+                })),
+                ..SpawnOptions::default()
+            },
+        )
+        .await
+        .expect("create owned control terminal");
+        let (owned_input, mut owned_output) = rpc
+            .bidi_streaming::<TermAttachReq, TermInput, TermOutput>(
+                TermAttachReq {
+                    id: owned_id.clone(),
+                    last_seq: 0,
+                },
+                256,
+                256,
+            )
+            .await
+            .expect("attach owned control terminal stream");
+        let (owned_pane_pid, owned_dead) =
+            pane_state(&socket.name, &owned_name).expect("owned pane state");
+        assert!(!owned_dead && process_exists(owned_pane_pid));
+        assert!(wait_for(
+            || exact_client_count(&socket.name, claude_name) == 1
+        ));
+        assert!(wait_for(
+            || exact_client_count(&socket.name, &owned_name) == 1
+        ));
+
+        let terminated: TmuxSessionTerminateResult = rpc
+            .rpc(TmuxSessionTerminateReq {
+                name: cars_name.to_string(),
+            })
+            .await
+            .expect("terminate cars tmux session");
+        assert!(terminated.error.is_none(), "{:?}", terminated.error);
+        assert_eq!(terminated.terminal_ids, [cars_two_id.clone()]);
+        assert!(wait_for(|| !exact_session_exists(&socket.name, cars_name)));
+        assert!(wait_for(|| !process_exists(cars_pane_pid)));
+        assert!(exact_session_exists(&socket.name, claude_name));
+        assert!(exact_session_exists(&socket.name, multi_name));
+        assert!(exact_session_exists(&socket.name, metachar_name));
+        assert!(exact_session_exists(&socket.name, &owned_name));
+        assert!(process_exists(claude_pane_pid));
+        assert!(process_exists(owned_pane_pid));
+        {
+            let terminals = server_session.terminals.lock().await;
+            assert!(!terminals.contains_key(&cars_two_id));
+            assert!(terminals.contains_key(&claude_id));
+            assert!(terminals.contains_key(&owned_id));
+        }
+
+        claude_input
+            .send(TermInput {
+                data: b"claude-after-cars-terminate\n".to_vec(),
+            })
+            .await
+            .expect("write preserved Claude terminal");
+        assert_terminal_output!(claude_output, "fixture:claude:claude-after-cars-terminate");
+        owned_input
+            .send(TermInput {
+                data: b"owned-after-cars-terminate\n".to_vec(),
+            })
+            .await
+            .expect("write preserved owned terminal");
+        assert_terminal_output!(owned_output, "fixture:pi:owned-after-cars-terminate");
+
+        let listed_after_terminate: TmuxSessionListResult = rpc
+            .rpc(TmuxSessionListReq {})
+            .await
+            .expect("list after custom termination");
+        assert!(listed_after_terminate.available);
+        assert!(listed_after_terminate.error.is_none());
+        let expected_after_terminate: Vec<&str> = expected_custom_order
+            .iter()
+            .copied()
+            .filter(|name| *name != cars_name)
+            .collect();
+        assert_eq!(
+            listed_after_terminate
+                .sessions
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            expected_after_terminate
+        );
+
+        let metachar_id = attach_custom_session(&rpc, metachar_name).await;
+        let (metachar_input, mut metachar_output) = rpc
+            .bidi_streaming::<TermAttachReq, TermInput, TermOutput>(
+                TermAttachReq {
+                    id: metachar_id.clone(),
+                    last_seq: 0,
+                },
+                256,
+                256,
+            )
+            .await
+            .expect("attach metacharacter terminal stream");
+        assert!(wait_for(|| {
+            exact_client_count(&socket.name, metachar_name) == 1
+        }));
+        metachar_input
+            .send(TermInput {
+                data: b"metachar-exact-target\n".to_vec(),
+            })
+            .await
+            .expect("write metacharacter terminal");
+        assert_terminal_output!(metachar_output, "fixture:claude:metachar-exact-target");
+        assert!(
+            !injection_sentinel.exists(),
+            "metacharacters in the session name executed during attach"
+        );
+
+        let metachar_terminated: TmuxSessionTerminateResult = rpc
+            .rpc(TmuxSessionTerminateReq {
+                name: metachar_name.to_string(),
+            })
+            .await
+            .expect("terminate exact metacharacter session");
+        assert!(
+            metachar_terminated.error.is_none(),
+            "{:?}",
+            metachar_terminated.error
+        );
+        assert_eq!(metachar_terminated.terminal_ids, [metachar_id]);
+        assert!(wait_for(|| {
+            !exact_session_exists(&socket.name, metachar_name)
+        }));
+        assert!(
+            !injection_sentinel.exists(),
+            "metacharacters in the session name executed during termination"
+        );
+        assert!(exact_session_exists(&socket.name, claude_name));
+        assert!(exact_session_exists(&socket.name, multi_name));
+        assert!(exact_session_exists(&socket.name, &owned_name));
+
+        for id in [claude_id, owned_id] {
+            let closed: TermCloseResult = rpc
+                .rpc(TermCloseReq { id })
+                .await
+                .expect("close preserved terminal");
+            assert!(closed.ok);
+        }
+    }
+}

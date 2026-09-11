@@ -1,12 +1,13 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use tracing::error;
-use zedra_rpc::proto::{AgentFile, AgentSummary, HostEvent};
+use zedra_rpc::proto::{AgentFile, AgentSessionSummary, AgentSummary, HostEvent};
 use zedra_session::{Session, SessionHandle};
 
 use crate::agent_ui::{
-    AgentSessionListProps, AgentSessionSection, cli_version_display, group_sessions_by_day,
-    render_agent_session_list, render_extra_row, render_usage_row, setup_label,
+    AgentSessionListProps, AgentSessionSection, SharedSessionPollHandle, cli_version_display,
+    group_sessions_by_day, merge_shared_sessions, render_agent_session_list, render_extra_row,
+    render_usage_row, setup_label, spawn_shared_session_poll,
 };
 use crate::file_preview_view::FilePreviewView;
 use crate::fonts;
@@ -31,10 +32,15 @@ pub struct AgentDetail {
     agent: Option<AgentSummary>,
     /// Grouped once per load; `render` must stay free of sorting and grouping.
     sections: Vec<AgentSessionSection>,
+    /// Persisted rows from the last load, for re-merging with fresh shares.
+    sessions: Vec<AgentSessionSummary>,
     /// Read-only config/memory files (Hermes). Empty for agents without a set.
     files: Vec<AgentFile>,
     /// Persistent preview for the native file sheet; its content swaps per tap.
     file_preview: Entity<FilePreviewView>,
+    /// Live tmux snapshots for the session list.
+    workspace_state: Entity<WorkspaceState>,
+    shared_poll: SharedSessionPollHandle,
     agent_state: LoadState,
     session_state: LoadState,
     loading_epoch: u64,
@@ -51,18 +57,28 @@ impl AgentDetail {
         cx: &mut Context<Self>,
     ) -> Self {
         let file_preview =
-            cx.new(|cx| FilePreviewView::new(session_handle.clone(), workspace_state, cx));
+            cx.new(|cx| FilePreviewView::new(session_handle.clone(), workspace_state.clone(), cx));
+        let (poll_task, poll_handle) = spawn_shared_session_poll(
+            session_handle.clone(),
+            workspace_state.clone(),
+            vec![slug.clone()],
+            |this, cx| this.rebuild_sections(cx),
+            cx,
+        );
         let mut view = Self {
             slug,
             agent: None,
             sections: Vec::new(),
+            sessions: Vec::new(),
             files: Vec::new(),
             file_preview,
+            workspace_state,
+            shared_poll: poll_handle,
             agent_state: LoadState::Loading,
             session_state: LoadState::Loading,
             loading_epoch: 0,
             session_handle,
-            _tasks: Vec::new(),
+            _tasks: vec![poll_task],
         };
         view.subscribe_agent_info(session, cx);
         view.reload(false, cx);
@@ -104,6 +120,9 @@ impl AgentDetail {
     }
 
     fn reload(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        if refresh {
+            self.shared_poll.request_refresh();
+        }
         self.loading_epoch = self.loading_epoch.wrapping_add(1);
         let epoch = self.loading_epoch;
         self.agent_state = LoadState::Loading;
@@ -146,7 +165,8 @@ impl AgentDetail {
                 }
                 match sessions {
                     Ok(sessions) => {
-                        this.sections = group_sessions_by_day(sessions);
+                        this.sessions = sessions;
+                        this.rebuild_sections(cx);
                         this.session_state = LoadState::Ready;
                     }
                     Err(err) => {
@@ -159,6 +179,14 @@ impl AgentDetail {
             });
         });
         self._tasks.push(task);
+    }
+
+    /// Re-derive sections from persisted rows plus the live tmux snapshot.
+    fn rebuild_sections(&mut self, cx: &mut Context<Self>) {
+        let snapshots = self.workspace_state.read(cx).shared_sessions.clone();
+        self.sections =
+            group_sessions_by_day(merge_shared_sessions(self.sessions.clone(), &snapshots));
+        cx.notify();
     }
 
     fn header_title(&self) -> String {

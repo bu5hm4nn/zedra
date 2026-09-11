@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::*;
+use zedra_rpc::proto::TmuxClientDeviceKind;
 
 use crate::active_terminal;
 use crate::deeplink;
@@ -92,6 +93,8 @@ unsafe extern "C" {
     fn ios_get_os_version() -> *const std::ffi::c_char;
     /// Returns the native device name for Delta node labels.
     fn ios_get_delta_device_name() -> *const std::ffi::c_char;
+    /// Returns 1 for iPad and 0 for other supported iOS idioms.
+    fn ios_get_tmux_client_device_kind() -> i32;
     /// Present a native UIAlertController with dynamic buttons.
     /// `labels` and `styles` are parallel arrays of length `button_count`.
     /// Style values: 0 = default, 1 = cancel, 2 = destructive.
@@ -253,6 +256,13 @@ impl PlatformBridge for IosBridge {
                 return false;
             }
             gpui_ios_is_keyboard_visible(window)
+        }
+    }
+
+    fn tmux_client_device_kind(&self) -> TmuxClientDeviceKind {
+        match unsafe { ios_get_tmux_client_device_kind() } {
+            1 => TmuxClientDeviceKind::Tablet,
+            _ => TmuxClientDeviceKind::Phone,
         }
     }
 

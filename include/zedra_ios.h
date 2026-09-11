@@ -112,6 +112,11 @@ extern const char *ios_get_os_version(void);
 extern const char *ios_get_delta_device_name(void);
 
 /**
+ * Returns 1 for iPad and 0 for other supported iOS idioms.
+ */
+extern int32_t ios_get_tmux_client_device_kind(void);
+
+/**
  * Present a native UIAlertController with dynamic buttons.
  * `labels` and `styles` are parallel arrays of length `button_count`.
  * Style values: 0 = default, 1 = cancel, 2 = destructive.

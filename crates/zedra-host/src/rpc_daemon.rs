@@ -18,12 +18,13 @@ use crate::host_info;
 use crate::identity::SharedIdentity;
 use crate::metrics;
 use crate::paths;
-use crate::pty::{ShellSession, SpawnOptions};
+use crate::pty::{ShellSession, SpawnOptions, TerminalBacking};
 use crate::session_registry::{
     finish_auth_failed_connection, finish_host_connection, ActiveClientConnection, AttachResult,
     ConsumeSlotResult, HostTermMeta, OutputSenderSlot, PairingSlotMode, ServerSession,
     SessionRegistry, TermBacklog, TermSession, MAX_WATCHED_PATHS_PER_SESSION,
 };
+use crate::tmux;
 use crate::uploads;
 use crate::utils;
 use anyhow::Result;
@@ -266,8 +267,9 @@ fn initial_host_meta(opts: &SpawnOptions) -> HostTermMeta {
         ..Default::default()
     };
     if let Some(command) = opts
-        .launch_cmd
+        .identity_launch_cmd
         .as_ref()
+        .or(opts.launch_cmd.as_ref())
         .filter(|command| !command.is_empty())
     {
         // Spawned terminals never emit 633;E for the launch command itself.
@@ -521,6 +523,7 @@ mod terminal_meta_preamble_tests {
             launch_cmd: Some("claude --resume session".to_owned()),
             color_scheme: None,
             env: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -2291,6 +2294,7 @@ pub async fn create_terminal(
 
     let color_scheme = opts.color_scheme.unwrap_or(TerminalColorScheme::Dark);
     let initial_meta = initial_host_meta(&opts);
+    let backing = opts.backing.take();
     let shell = ShellSession::spawn(cols, rows, opts)?;
     let (pty_reader, pty_writer, master, child) = shell.take_reader();
 
@@ -2325,6 +2329,7 @@ pub async fn create_terminal(
                 backlog: backlog.clone(),
                 created_at: std::time::SystemTime::now(),
                 started_at: std::time::Instant::now(),
+                backing,
             },
         )
         .await;
@@ -3335,6 +3340,7 @@ async fn dispatch(
                     launch_cmd,
                     color_scheme: None,
                     env: Vec::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -3378,6 +3384,7 @@ async fn dispatch(
                     launch_cmd,
                     color_scheme: msg.color_scheme,
                     env: Vec::new(),
+                    ..Default::default()
                 },
             )
             .await
@@ -3920,6 +3927,59 @@ async fn dispatch(
             let _ = msg.tx.send(result).await;
         }
 
+        ZedraMessage::AgentShareList(msg) => {
+            session.touch().await;
+            let result = agent_share_list_result(&msg.slug).await;
+            let _ = msg.tx.send(result).await;
+        }
+
+        ZedraMessage::AgentShareTerminate(msg) => {
+            session.touch().await;
+            let result = agent_share_terminate_result(&session, &msg.slug, &msg.session_id).await;
+            let _ = msg.tx.send(result).await;
+        }
+
+        ZedraMessage::TmuxSessionList(msg) => {
+            session.touch().await;
+            let result = tmux_session_list_result(&state, &session, &registry).await;
+            let _ = msg.tx.send(result).await;
+        }
+
+        ZedraMessage::TmuxSessionAttach(msg) => {
+            session.touch().await;
+            let workdir = session
+                .workdir
+                .clone()
+                .or_else(|| Some(state.workdir.clone()));
+            let result = tmux_session_attach_result(
+                &session,
+                workdir,
+                &msg.name,
+                msg.cols,
+                msg.rows,
+                client_pubkey,
+                msg.device_kind,
+            )
+            .await;
+            if result.error.is_none() {
+                zedra_telemetry::send(Event::HostTerminalOpen {
+                    has_launch_cmd: true,
+                });
+                let terminal_count = session.terminals.lock().await.len();
+                if let Err(error) = metrics::record_terminal_created(&state.workdir, terminal_count)
+                {
+                    tracing::warn!("Failed to record terminal metrics: {}", error);
+                }
+            }
+            let _ = msg.tx.send(result).await;
+        }
+
+        ZedraMessage::TmuxSessionTerminate(msg) => {
+            session.touch().await;
+            let result = tmux_session_terminate_result(&session, &msg.name).await;
+            let _ = msg.tx.send(result).await;
+        }
+
         ZedraMessage::AgentFiles(msg) => {
             session.touch().await;
             let slug = msg.slug.clone();
@@ -3946,66 +4006,57 @@ async fn dispatch(
                 .workdir
                 .clone()
                 .or_else(|| Some(state.workdir.clone()));
-            let launch_cmd = agent::resume_launch_command(&msg.slug, &msg.session_id);
-            let Some(launch_cmd) = launch_cmd else {
-                // `None` collapses three causes; report the specific one.
-                let error = if agent::actor(&msg.slug).is_none() {
-                    format!("unknown agent: {}", msg.slug)
-                } else if msg.session_id.trim().is_empty() {
-                    "missing session id".to_string()
-                } else {
-                    format!("agent {} does not support resume", msg.slug)
-                };
-                let _ = msg
-                    .tx
-                    .send(AgentResumeResult {
-                        terminal_id: String::new(),
-                        error: Some(error),
-                    })
-                    .await;
-                return Ok(());
-            };
-            match create_terminal(
-                &session,
-                msg.cols,
-                msg.rows,
-                SpawnOptions {
-                    workdir,
-                    launch_cmd: Some(launch_cmd),
-                    color_scheme: None,
-                    env: Vec::new(),
-                },
-            )
-            .await
-            {
-                Ok(terminal_id) => {
-                    zedra_telemetry::send(Event::HostTerminalOpen {
-                        has_launch_cmd: true,
-                    });
-                    let terminal_count = session.terminals.lock().await.len();
-                    if let Err(e) = metrics::record_terminal_created(&state.workdir, terminal_count)
+            let result =
+                match agent::resume_terminal_launch(&msg.slug, &msg.session_id, workdir.clone())
+                    .await
+                {
+                    Ok(launch) => match create_terminal(
+                        &session,
+                        msg.cols,
+                        msg.rows,
+                        SpawnOptions {
+                            workdir,
+                            launch_cmd: Some(launch.launch_cmd),
+                            color_scheme: None,
+                            env: Vec::new(),
+                            identity_launch_cmd: launch.identity_cmd,
+                            backing: launch.backing,
+                        },
+                    )
+                    .await
                     {
-                        tracing::warn!("Failed to record terminal metrics: {}", e);
-                    }
-                    let _ = msg
-                        .tx
-                        .send(AgentResumeResult {
-                            terminal_id,
-                            error: None,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!("AgentResume failed: {}", e);
-                    let _ = msg
-                        .tx
-                        .send(AgentResumeResult {
+                        Ok(terminal_id) => {
+                            zedra_telemetry::send(Event::HostTerminalOpen {
+                                has_launch_cmd: true,
+                            });
+                            let terminal_count = session.terminals.lock().await.len();
+                            if let Err(e) =
+                                metrics::record_terminal_created(&state.workdir, terminal_count)
+                            {
+                                tracing::warn!("Failed to record terminal metrics: {}", e);
+                            }
+                            AgentResumeResult {
+                                terminal_id,
+                                error: None,
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("AgentResume failed: {}", e);
+                            AgentResumeResult {
+                                terminal_id: String::new(),
+                                error: Some(e.to_string()),
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!("AgentResume failed: {}", error);
+                        AgentResumeResult {
                             terminal_id: String::new(),
-                            error: Some(e.to_string()),
-                        })
-                        .await;
-                }
-            }
+                            error: Some(error.to_string()),
+                        }
+                    }
+                };
+            let _ = msg.tx.send(result).await;
         }
 
         // -- LSP --
@@ -4056,6 +4107,375 @@ async fn dispatch(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// List live tmux-backed shared sessions for `slug`.
+///
+/// Capability-gated through the actor registry (no per-agent match arms).
+/// A host without usable tmux reports `available: false` with the exact
+/// actionable reason; persisted agent history is untouched by this call.
+async fn agent_share_list_result(slug: &str) -> AgentShareListResult {
+    let Some(actor) = agent::actor(slug) else {
+        return AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some(format!("unknown agent: {slug}")),
+        };
+    };
+    if !actor.supports_shared_sessions() {
+        return AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some(format!("agent {slug} does not support shared sessions")),
+        };
+    }
+    // tmux discovery and listing are subprocess calls; keep them off the
+    // async dispatch path.
+    let slug_owned = actor.slug().to_string();
+    match tokio::task::spawn_blocking(tmux::TmuxClient::discover).await {
+        Ok(Ok(client)) => {
+            let version = client.version().to_string();
+            match tokio::task::spawn_blocking(move || client.list_sessions(&slug_owned)).await {
+                Ok(Ok(panes)) => AgentShareListResult {
+                    available: true,
+                    version,
+                    sessions: panes
+                        .into_iter()
+                        .map(|pane| AgentShareSession {
+                            session_id: pane.session_id,
+                            title: Some(pane.metadata.title).filter(|t| !t.is_empty()),
+                            cwd: Some(pane.metadata.current_path).filter(|c| !c.is_empty()),
+                            current_command: Some(pane.process.current_command)
+                                .filter(|c| !c.is_empty()),
+                            dead: pane.process.dead,
+                            exit_code: pane.process.exit_code,
+                        })
+                        .collect(),
+                    error: None,
+                },
+                Ok(Err(error)) => AgentShareListResult {
+                    available: false,
+                    version,
+                    sessions: Vec::new(),
+                    error: Some(error.to_string()),
+                },
+                Err(join) => AgentShareListResult {
+                    available: false,
+                    version: String::new(),
+                    sessions: Vec::new(),
+                    error: Some(join.to_string()),
+                },
+            }
+        }
+        Ok(Err(error)) => AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some(error.to_string()),
+        },
+        Err(join) => AgentShareListResult {
+            available: false,
+            version: String::new(),
+            sessions: Vec::new(),
+            error: Some(join.to_string()),
+        },
+    }
+}
+
+/// Terminate one shared session: validate through the actor registry and the
+/// tmux ownership codec, then kill the tmux session (the agent process stops
+/// and every attached terminal client exits with it).
+///
+/// Only after the kill succeeds does host terminal state change: the removed
+/// terminals' client children are reaped through the normal close path and
+/// their ids returned so the client can drop its local cards. Terminals of
+/// other shared sessions — and plain terminals — stay untouched.
+async fn agent_share_terminate_result(
+    session: &ServerSession,
+    slug: &str,
+    session_id: &str,
+) -> AgentShareTerminateResult {
+    let failure = |error: String| AgentShareTerminateResult {
+        terminal_ids: Vec::new(),
+        error: Some(error),
+    };
+    let Some(actor) = agent::actor(slug) else {
+        return failure(format!("unknown agent: {slug}"));
+    };
+    if !actor.supports_shared_sessions() {
+        return failure(format!("agent {slug} does not support shared sessions"));
+    }
+    let slug_owned = actor.slug().to_string();
+    let session_id_owned = session_id.to_string();
+    let killed = tokio::task::spawn_blocking(move || {
+        tmux::TmuxClient::discover()
+            .and_then(|client| client.terminate_session(&slug_owned, &session_id_owned))
+    })
+    .await;
+    match killed {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return failure(error.to_string()),
+        Err(join) => return failure(join.to_string()),
+    }
+    let removed = session.remove_shared_terminals(slug, session_id).await;
+    let terminal_ids: Vec<String> = removed.iter().map(|(id, _)| id.clone()).collect();
+    for (id, terminal) in removed {
+        tokio::task::spawn_blocking(move || terminal.terminate())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(id = %id, err = %e, "failed to terminate shared terminal child");
+                false
+            });
+    }
+    AgentShareTerminateResult {
+        terminal_ids,
+        error: None,
+    }
+}
+
+/// List non-owned tmux sessions containing one coherent registered agent kind.
+async fn tmux_session_list_result(
+    state: &DaemonState,
+    session: &Arc<ServerSession>,
+    registry: &SessionRegistry,
+) -> TmuxSessionListResult {
+    let (version, detected) = match detected_tmux_sessions_with(tmux::TmuxClient::discover).await {
+        Ok(result) => result,
+        Err(error) => {
+            return TmuxSessionListResult {
+                available: false,
+                version: String::new(),
+                sessions: Vec::new(),
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let mut histories = HashMap::new();
+    for detected_session in &detected {
+        if histories.contains_key(&detected_session.agent_slug) {
+            continue;
+        }
+        let history = agent::list_agent_sessions(
+            &state.agent_cache,
+            &detected_session.agent_slug,
+            &state.workdir,
+            Some(session),
+            0,
+            false,
+        )
+        .await;
+        histories.insert(detected_session.agent_slug.clone(), history);
+    }
+
+    let mut clients = HashMap::new();
+    for detected_session in &detected {
+        clients.insert(
+            detected_session.name.clone(),
+            registry
+                .external_tmux_client_counts(
+                    &detected_session.name,
+                    detected_session.attached_clients,
+                )
+                .await,
+        );
+    }
+    TmuxSessionListResult {
+        available: true,
+        version,
+        sessions: tmux_session_summaries(detected, &histories, &clients),
+        error: None,
+    }
+}
+
+async fn detected_tmux_sessions_with<D>(
+    discover: D,
+) -> Result<(String, Vec<tmux::DetectedTmuxSession>)>
+where
+    D: FnOnce() -> Result<tmux::TmuxClient> + Send + 'static,
+{
+    let client = tokio::task::spawn_blocking(discover)
+        .await
+        .map_err(anyhow::Error::from)??;
+    let version = client.version().to_string();
+    let sessions = tokio::task::spawn_blocking(move || client.list_detected_sessions())
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok((version, sessions))
+}
+
+fn tmux_session_summaries(
+    detected: Vec<tmux::DetectedTmuxSession>,
+    histories: &HashMap<String, AgentSessionsResult>,
+    clients: &HashMap<String, TmuxClientCounts>,
+) -> Vec<TmuxSessionSummary> {
+    detected
+        .into_iter()
+        .map(|detected| {
+            let history = histories
+                .get(&detected.agent_slug)
+                .filter(|result| result.error.is_none())
+                .and_then(|result| {
+                    result.sessions.iter().find(|history| {
+                        agent::resume_launch_command(&detected.agent_slug, &history.session_id)
+                            .as_deref()
+                            == Some(detected.start_command.trim())
+                    })
+                });
+            let fallback_title = agent::utils::session_title(Some(detected.pane_title.clone()))
+                .unwrap_or_else(|| "Unknown".to_string());
+            let client_counts = clients.get(&detected.name).copied().unwrap_or_default();
+            TmuxSessionSummary {
+                name: detected.name,
+                agent_slug: detected.agent_slug,
+                title: history
+                    .and_then(|history| agent::utils::session_title(history.title.clone()))
+                    .unwrap_or(fallback_title),
+                last_activity_at: history
+                    .and_then(|history| history.last_activity_at.or(history.created_at))
+                    .or_else(|| {
+                        chrono::DateTime::from_timestamp(detected.activity_unix_seconds, 0)
+                    }),
+                git_branch: history
+                    .and_then(|history| history.git.as_ref())
+                    .and_then(|git| git.branch.clone()),
+                transcript_size_bytes: history.and_then(|history| history.transcript_size_bytes),
+                clients: client_counts,
+            }
+        })
+        .collect()
+}
+
+async fn tmux_session_attach_result(
+    session: &Arc<ServerSession>,
+    workdir: Option<PathBuf>,
+    name: &str,
+    cols: u16,
+    rows: u16,
+    client_pubkey: [u8; 32],
+    device_kind: TmuxClientDeviceKind,
+) -> TmuxSessionAttachResult {
+    tmux_session_attach_result_with(
+        session,
+        workdir,
+        name,
+        cols,
+        rows,
+        client_pubkey,
+        device_kind,
+        tmux::TmuxClient::discover,
+    )
+    .await
+}
+
+async fn tmux_session_attach_result_with<D>(
+    session: &Arc<ServerSession>,
+    workdir: Option<PathBuf>,
+    name: &str,
+    cols: u16,
+    rows: u16,
+    client_pubkey: [u8; 32],
+    device_kind: TmuxClientDeviceKind,
+    discover: D,
+) -> TmuxSessionAttachResult
+where
+    D: FnOnce() -> Result<tmux::TmuxClient> + Send + 'static,
+{
+    let failure = |error: String| TmuxSessionAttachResult {
+        terminal_id: String::new(),
+        error: Some(error),
+    };
+    let requested_name = name.to_string();
+    let name_for_discovery = requested_name.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let client = discover()?;
+        client.prepare_detected_attach(&name_for_discovery)
+    })
+    .await;
+    let (launch_cmd, identity_launch_cmd) = match prepared {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => return failure(error.to_string()),
+        Err(join) => return failure(join.to_string()),
+    };
+
+    match create_terminal(
+        session,
+        cols,
+        rows,
+        SpawnOptions {
+            workdir,
+            launch_cmd: Some(launch_cmd),
+            color_scheme: None,
+            env: Vec::new(),
+            identity_launch_cmd,
+            backing: Some(TerminalBacking::ExternalTmux {
+                session_name: requested_name,
+                client_pubkey,
+                device_kind,
+            }),
+        },
+    )
+    .await
+    {
+        Ok(terminal_id) => TmuxSessionAttachResult {
+            terminal_id,
+            error: None,
+        },
+        Err(error) => failure(error.to_string()),
+    }
+}
+
+async fn tmux_session_terminate_result(
+    session: &ServerSession,
+    name: &str,
+) -> TmuxSessionTerminateResult {
+    tmux_session_terminate_result_with(session, name, tmux::TmuxClient::discover).await
+}
+
+async fn tmux_session_terminate_result_with<D>(
+    session: &ServerSession,
+    name: &str,
+    discover: D,
+) -> TmuxSessionTerminateResult
+where
+    D: FnOnce() -> Result<tmux::TmuxClient> + Send + 'static,
+{
+    let failure = |error: String| TmuxSessionTerminateResult {
+        terminal_ids: Vec::new(),
+        error: Some(error),
+    };
+    let name_for_discovery = name.to_string();
+    let terminated = tokio::task::spawn_blocking(move || {
+        let client = discover()?;
+        client.terminate_detected_session(&name_for_discovery)
+    })
+    .await;
+    match terminated {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return failure(error.to_string()),
+        Err(join) => return failure(join.to_string()),
+    }
+
+    let removed = session.remove_external_tmux_terminals(name).await;
+    let terminal_ids = removed.iter().map(|(id, _)| id.clone()).collect();
+    for (id, terminal) in removed {
+        tokio::task::spawn_blocking(move || terminal.terminate())
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    id = %id,
+                    err = %error,
+                    "failed to terminate external tmux terminal child"
+                );
+                false
+            });
+    }
+    TmuxSessionTerminateResult {
+        terminal_ids,
+        error: None,
+    }
+}
 
 struct DiagnosticEntry {
     message: String,
@@ -4134,5 +4554,575 @@ pub(crate) fn os_version_string() -> Option<String> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod shared_resume_tests {
+    use super::*;
+    use crate::pty::{SharedSpawnIdentity, TerminalBacking};
+    use crate::session_registry::SessionRegistry;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn identity(slug: &str, session_id: &str) -> SharedSpawnIdentity {
+        SharedSpawnIdentity {
+            slug: slug.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// Terminals whose PTY child exits on its own: reaping is then instant
+    /// and hermetic, independent of the real login shell's profile.
+    fn terminal(backing: Option<TerminalBacking>) -> TermSession {
+        let shell = ShellSession::spawn(
+            80,
+            24,
+            SpawnOptions {
+                launch_cmd: Some("exit 0".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_reader, writer, master, child) = shell.take_reader();
+        TermSession {
+            writer: Arc::new(std::sync::Mutex::new(writer)),
+            master,
+            child,
+            output_sender: Arc::new(std::sync::Mutex::new(OutputSenderSlot {
+                gen: 0,
+                sender: None,
+            })),
+            host_meta: Arc::new(std::sync::Mutex::new(HostTermMeta::default())),
+            backlog: Arc::new(std::sync::Mutex::new(TermBacklog::new())),
+            created_at: std::time::SystemTime::now(),
+            started_at: std::time::Instant::now(),
+            backing,
+        }
+    }
+
+    async fn session() -> Arc<ServerSession> {
+        SessionRegistry::new()
+            .create_named("shared-resume-test", PathBuf::from("/tmp"))
+            .await
+    }
+
+    /// Executable stub `tmux` binary (never a real server) whose `-V`
+    /// behavior comes from `script`.
+    fn stub_tmux(name: &str, script: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("zedra-{name}-{}", std::process::id()));
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn custom_tmux_discovery_omits_multi_agent_sessions_and_surfaces_failures() {
+        let stub = stub_tmux(
+            "custom-list-handler",
+            r#"#!/bin/sh
+case "$1" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) echo 'cars_us|0|1726000000' ;;
+list-panes)
+  case "$6" in
+    *pane_current_command*) printf '%s\n' '%1|pi|0|' '%2|omp|0|' ;;
+    *) printf '%s\n' '%1|pi|/tmp|pi' '%2|omp|/tmp|omp' ;;
+  esac
+  ;;
+esac
+exit 0
+"#,
+        );
+        let binary = stub.clone();
+        let (version, sessions) =
+            detected_tmux_sessions_with(move || tmux::TmuxClient::with_socket(&binary, None))
+                .await
+                .unwrap();
+        assert_eq!(version, "3.5");
+        assert!(sessions.is_empty());
+
+        let unavailable = detected_tmux_sessions_with(|| {
+            Err(anyhow::anyhow!("tmux unavailable for handler test"))
+        })
+        .await
+        .unwrap_err();
+        assert!(unavailable
+            .to_string()
+            .contains("tmux unavailable for handler test"));
+        let _ = std::fs::remove_file(stub);
+    }
+
+    fn detected_session(title: &str, start_command: &str) -> tmux::DetectedTmuxSession {
+        tmux::DetectedTmuxSession {
+            name: "cars_us".into(),
+            agent_slug: "pi".into(),
+            identity_command: "pi".into(),
+            pane_title: title.into(),
+            current_path: "/tmp".into(),
+            start_command: start_command.into(),
+            attached_clients: 0,
+            activity_unix_seconds: 1_726_000_000,
+        }
+    }
+
+    fn historical_session() -> AgentSessionSummary {
+        AgentSessionSummary {
+            slug: "pi".into(),
+            session_id: "history-1".into(),
+            title: Some("Historical title".into()),
+            cwd: Some("/tmp".into()),
+            created_at: chrono::DateTime::from_timestamp(1_725_000_000, 0),
+            last_activity_at: chrono::DateTime::from_timestamp(1_725_000_100, 0),
+            resume: agent::utils::resume_summary("pi", "history-1"),
+            git: Some(AgentGitSummary {
+                branch: Some("feat/history".into()),
+                worktree: None,
+                commit_hash: None,
+                repository_url: None,
+                pr_number: None,
+                pr_url: None,
+                pr_repository: None,
+            }),
+            usage: None,
+            transcript_size_bytes: Some(4096),
+        }
+    }
+
+    #[test]
+    fn custom_tmux_exact_history_metadata_wins() {
+        let histories = HashMap::from([(
+            "pi".to_string(),
+            AgentSessionsResult {
+                sessions: vec![historical_session()],
+                total: 1,
+                error: None,
+            },
+        )]);
+        let clients = HashMap::from([(
+            "cars_us".to_string(),
+            TmuxClientCounts {
+                phone: 1,
+                tablet: 2,
+                desktop: 3,
+            },
+        )]);
+        let rows = tmux_session_summaries(
+            vec![detected_session("Pane title", "pi --session history-1")],
+            &histories,
+            &clients,
+        );
+        let row = &rows[0];
+        assert_eq!(row.title, "Historical title");
+        assert_eq!(row.git_branch.as_deref(), Some("feat/history"));
+        assert_eq!(row.transcript_size_bytes, Some(4096));
+        assert_eq!(
+            row.last_activity_at,
+            chrono::DateTime::from_timestamp(1_725_000_100, 0)
+        );
+        assert_eq!(row.clients, clients["cars_us"]);
+    }
+
+    #[test]
+    fn custom_tmux_mismatch_and_history_failure_use_pane_fallbacks() {
+        let failed = HashMap::from([(
+            "pi".to_string(),
+            AgentSessionsResult {
+                sessions: vec![historical_session()],
+                total: 1,
+                error: Some("cache unavailable".into()),
+            },
+        )]);
+        let rows = tmux_session_summaries(
+            vec![
+                detected_session("  Pane title  ", "pi"),
+                detected_session("  ", "pi"),
+            ],
+            &failed,
+            &HashMap::new(),
+        );
+        assert_eq!(rows[0].title, "Pane title");
+        assert_eq!(rows[1].title, "Unknown");
+        for row in rows {
+            assert_eq!(
+                row.last_activity_at,
+                chrono::DateTime::from_timestamp(1_726_000_000, 0)
+            );
+            assert_eq!(row.git_branch, None);
+            assert_eq!(row.transcript_size_bytes, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_terminals_get_distinct_output_slots() {
+        let session = session().await;
+        session
+            .insert_terminal(
+                "a".to_string(),
+                terminal(Some(TerminalBacking::SharedAgent(identity("pi", "s1")))),
+            )
+            .await;
+        session
+            .insert_terminal(
+                "b".to_string(),
+                terminal(Some(TerminalBacking::SharedAgent(identity("pi", "s1")))),
+            )
+            .await;
+        let terms = session.terminals.lock().await;
+        let slot_a = Arc::as_ptr(&terms["a"].output_sender) as usize;
+        let slot_b = Arc::as_ptr(&terms["b"].output_sender) as usize;
+        assert_ne!(slot_a, slot_b);
+    }
+
+    #[tokio::test]
+    async fn close_removes_only_selected_terminal() {
+        let session = session().await;
+        session
+            .insert_terminal(
+                "a".to_string(),
+                terminal(Some(TerminalBacking::SharedAgent(identity("pi", "s1")))),
+            )
+            .await;
+        session
+            .insert_terminal(
+                "b".to_string(),
+                terminal(Some(TerminalBacking::SharedAgent(identity("pi", "s1")))),
+            )
+            .await;
+        session.remove_terminal("a").await.unwrap().terminate();
+        let terms = session.terminals.lock().await;
+        assert_eq!(terms.len(), 1);
+        assert!(terms.contains_key("b"));
+    }
+
+    #[tokio::test]
+    async fn shared_termination_removes_matching_and_leaves_others() {
+        let session = session().await;
+        for (id, backing) in [
+            (
+                "shared-1",
+                Some(TerminalBacking::SharedAgent(identity("pi", "s1"))),
+            ),
+            (
+                "shared-2",
+                Some(TerminalBacking::SharedAgent(identity("pi", "s1"))),
+            ),
+            (
+                "omp-same-id",
+                Some(TerminalBacking::SharedAgent(identity("omp", "s1"))),
+            ),
+            (
+                "other-shared",
+                Some(TerminalBacking::SharedAgent(identity("pi", "s9"))),
+            ),
+            ("plain", None),
+        ] {
+            session
+                .insert_terminal(id.to_string(), terminal(backing))
+                .await;
+        }
+
+        let removed = session.remove_shared_terminals("pi", "s1").await;
+        let ids: Vec<&str> = removed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["shared-1", "shared-2"]);
+        for (_, terminal) in removed {
+            assert!(terminal.terminate());
+        }
+        {
+            let terms = session.terminals.lock().await;
+            assert_eq!(terms.len(), 3);
+            assert!(terms.contains_key("omp-same-id"));
+            assert!(terms.contains_key("other-shared"));
+            assert!(terms.contains_key("plain"));
+        }
+
+        let removed = session.remove_shared_terminals("omp", "s1").await;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, "omp-same-id");
+        for (_, terminal) in removed {
+            assert!(terminal.terminate());
+        }
+
+        let terms = session.terminals.lock().await;
+        assert_eq!(terms.len(), 2);
+        assert!(terms.contains_key("other-shared"));
+        assert!(terms.contains_key("plain"));
+        let order = session.terminal_order.lock().await;
+        assert_eq!(*order, ["other-shared".to_string(), "plain".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn pi_and_omp_shared_launches_keep_provider_identity_and_distinct_targets() {
+        for (slug, target) in [
+            ("pi", "zedra-pi-616263313233"),
+            ("omp", "zedra-omp-616263313233"),
+        ] {
+            let identity_command =
+                agent::resume_launch_command(slug, "abc123").expect("actor resume command");
+            let stub = stub_tmux(
+                &format!("shared-launch-{slug}"),
+                "#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then echo 'tmux 3.5'; fi\nexit 0\n",
+            );
+            let binary = stub.clone();
+            let launch = agent::resume_terminal_launch_with(
+                slug,
+                "abc123",
+                Some(PathBuf::from("/tmp")),
+                move || tmux::TmuxClient::with_socket(&binary, None),
+            )
+            .await
+            .expect("shared launch");
+            assert_eq!(
+                launch.identity_cmd.as_deref(),
+                Some(identity_command.as_str())
+            );
+            assert!(
+                launch.launch_cmd.contains(target),
+                "{:?}",
+                launch.launch_cmd
+            );
+            assert_eq!(
+                launch.backing,
+                Some(TerminalBacking::SharedAgent(identity(slug, "abc123")))
+            );
+            let _ = std::fs::remove_file(&stub);
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_tmux_attach_and_termination_track_exact_external_backing() {
+        let session = session().await;
+        let stub = stub_tmux(
+            "custom-handler",
+            r#"#!/bin/sh
+case "$1" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) echo 'cars_us' ;;
+list-panes)
+  case "$6" in
+    *pane_current_command*) echo '%1|pi|0|' ;;
+    *) echo '%1|title|/tmp|pi' ;;
+  esac
+  ;;
+kill-session) [ "$3" = '=cars_us' ] || exit 7 ;;
+esac
+exit 0
+"#,
+        );
+        let attach_binary = stub.clone();
+        let attached = tmux_session_attach_result_with(
+            &session,
+            Some(PathBuf::from("/tmp")),
+            "cars_us",
+            80,
+            24,
+            [7; 32],
+            TmuxClientDeviceKind::Tablet,
+            move || tmux::TmuxClient::with_socket(&attach_binary, None),
+        )
+        .await;
+        assert_eq!(attached.error, None);
+        assert!(!attached.terminal_id.is_empty());
+        {
+            let terminals = session.terminals.lock().await;
+            let terminal = &terminals[&attached.terminal_id];
+            assert!(matches!(
+                terminal.backing.as_ref(),
+                Some(TerminalBacking::ExternalTmux {
+                    session_name,
+                    client_pubkey,
+                    device_kind,
+                }) if session_name == "cars_us"
+                    && client_pubkey == &[7; 32]
+                    && *device_kind == TmuxClientDeviceKind::Tablet
+            ));
+            let meta = terminal.host_meta.lock().unwrap();
+            assert_eq!(meta.current_command.as_deref(), Some("pi"));
+            assert_eq!(meta.agent_slug, Some("pi"));
+        }
+
+        session
+            .insert_terminal(
+                "other-custom".to_string(),
+                terminal(Some(TerminalBacking::ExternalTmux {
+                    session_name: "other".to_string(),
+                    client_pubkey: [8; 32],
+                    device_kind: TmuxClientDeviceKind::Desktop,
+                })),
+            )
+            .await;
+        session
+            .insert_terminal(
+                "owned".to_string(),
+                terminal(Some(TerminalBacking::SharedAgent(identity("pi", "s1")))),
+            )
+            .await;
+
+        let terminate_binary = stub.clone();
+        let terminated = tmux_session_terminate_result_with(&session, "cars_us", move || {
+            tmux::TmuxClient::with_socket(&terminate_binary, None)
+        })
+        .await;
+        assert_eq!(terminated.error, None);
+        assert_eq!(terminated.terminal_ids, [attached.terminal_id]);
+        {
+            let terminals = session.terminals.lock().await;
+            assert_eq!(terminals.len(), 2);
+            assert!(terminals.contains_key("other-custom"));
+            assert!(terminals.contains_key("owned"));
+        }
+
+        for id in ["other-custom", "owned"] {
+            if let Some(terminal) = session.remove_terminal(id).await {
+                terminal.terminate();
+            }
+        }
+        let _ = std::fs::remove_file(stub);
+    }
+
+    #[tokio::test]
+    async fn custom_tmux_termination_error_preserves_external_terminal_state() {
+        let session = session().await;
+        session
+            .insert_terminal(
+                "external".to_string(),
+                terminal(Some(TerminalBacking::ExternalTmux {
+                    session_name: "cars_us".to_string(),
+                    client_pubkey: [9; 32],
+                    device_kind: TmuxClientDeviceKind::Phone,
+                })),
+            )
+            .await;
+        let stub = stub_tmux(
+            "custom-handler-failure",
+            r#"#!/bin/sh
+case "$1" in
+-V) echo 'tmux 3.5' ;;
+list-sessions) echo 'cars_us' ;;
+list-panes)
+  case "$6" in
+    *pane_current_command*) echo '%1|pi|0|' ;;
+    *) echo '%1|title|/tmp|pi' ;;
+  esac
+  ;;
+kill-session) echo 'permission denied' >&2; exit 7 ;;
+esac
+exit 0
+"#,
+        );
+        let terminate_binary = stub.clone();
+        let result = tmux_session_terminate_result_with(&session, "cars_us", move || {
+            tmux::TmuxClient::with_socket(&terminate_binary, None)
+        })
+        .await;
+        assert!(result.terminal_ids.is_empty());
+        assert!(result.error.is_some());
+        assert!(session.terminals.lock().await.contains_key("external"));
+
+        if let Some(terminal) = session.remove_terminal("external").await {
+            terminal.terminate();
+        }
+        let _ = std::fs::remove_file(stub);
+    }
+
+    #[tokio::test]
+    async fn share_list_reports_registry_non_capability_without_tmux_discovery() {
+        for slug in ["claude", "not-registered"] {
+            let result = agent_share_list_result(slug).await;
+            assert!(!result.available);
+            assert!(result.sessions.is_empty());
+            assert!(result.error.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_resume_without_tmux_fails_for_pi_and_omp_before_terminal_insert() {
+        let session = session().await;
+        for slug in ["pi", "omp"] {
+            let error = agent::resume_terminal_launch_with(
+                slug,
+                "abc123",
+                Some(PathBuf::from("/tmp")),
+                || tmux::TmuxClient::with_socket("/nonexistent/tmux-for-zedra-test", None),
+            )
+            .await
+            .err()
+            .expect("resume must fail when the tmux binary is missing");
+            assert!(error.to_string().contains("tmux"), "unexpected: {error:#}");
+        }
+        assert!(session.terminals.lock().await.is_empty());
+        assert!(session.terminal_order.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_resume_with_old_tmux_fails_for_pi_and_omp_before_terminal_insert() {
+        let session = session().await;
+        let stub = stub_tmux("old", "#!/bin/sh\necho 'tmux 3.2'\n");
+        for slug in ["pi", "omp"] {
+            let probe = stub.clone();
+            let error = agent::resume_terminal_launch_with(
+                slug,
+                "abc123",
+                Some(PathBuf::from("/tmp")),
+                move || tmux::TmuxClient::with_socket(&probe, None),
+            )
+            .await
+            .err()
+            .expect("resume must fail on a too-old tmux");
+            assert!(
+                error.to_string().contains("too old"),
+                "unexpected: {error:#}"
+            );
+        }
+        assert!(session.terminals.lock().await.is_empty());
+        assert!(session.terminal_order.lock().await.is_empty());
+        let _ = std::fs::remove_file(&stub);
+    }
+
+    #[tokio::test]
+    async fn shared_resume_with_hung_tmux_times_out_for_pi_and_omp_before_terminal_insert() {
+        let session = session().await;
+        let stub = stub_tmux("hung", "#!/bin/sh\nsleep 30\n");
+        for slug in ["pi", "omp"] {
+            let probe = stub.clone();
+            let error = agent::resume_terminal_launch_with(
+                slug,
+                "abc123",
+                Some(PathBuf::from("/tmp")),
+                move || tmux::TmuxClient::with_socket(&probe, None),
+            )
+            .await
+            .err()
+            .expect("resume must time out against a hung tmux");
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("timed out"), "unexpected: {rendered}");
+        }
+        assert!(session.terminals.lock().await.is_empty());
+        assert!(session.terminal_order.lock().await.is_empty());
+        let _ = std::fs::remove_file(&stub);
+    }
+
+    #[tokio::test]
+    async fn nonshared_agent_resume_keeps_direct_launch_without_tmux() {
+        let launch = agent::resume_terminal_launch("claude", "abc123", None)
+            .await
+            .expect("non-shared resume must keep the direct launch");
+        assert!(launch.launch_cmd.contains("claude"));
+        assert!(launch.launch_cmd.contains("abc123"));
+        assert_eq!(launch.identity_cmd, None);
+        assert_eq!(launch.backing, None);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_blank_session_id_before_anything_spawns() {
+        let session = session().await;
+        let error = agent::resume_terminal_launch("pi", "   ", None)
+            .await
+            .err()
+            .expect("blank session id must fail");
+        assert!(
+            error.to_string().contains("missing session id"),
+            "unexpected: {error:#}"
+        );
+        assert!(session.terminals.lock().await.is_empty());
     }
 }

@@ -366,3 +366,8 @@ func ios_get_delta_device_name() -> UnsafePointer<CChar>? {
     let hostname = ProcessInfo.processInfo.hostName.trimmingCharacters(in: .whitespacesAndNewlines)
     return ZedraDeltaCStringStorage.shared.pointer(for: "device_name", value: hostname)
 }
+
+@_cdecl("ios_get_tmux_client_device_kind")
+func ios_get_tmux_client_device_kind() -> Int32 {
+    UIDevice.current.userInterfaceIdiom == .pad ? 1 : 0
+}

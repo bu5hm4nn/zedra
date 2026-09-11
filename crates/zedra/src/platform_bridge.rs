@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use tokio::sync::broadcast;
 
 use gpui::{AnyView, App, Bounds, Entity, Pixels, Point, Render};
+use zedra_rpc::proto::TmuxClientDeviceKind;
 
 // ---------------------------------------------------------------------------
 // Native alert API
@@ -1090,6 +1091,9 @@ pub trait PlatformBridge: Send + Sync + 'static {
     /// Returns the native device name suitable for user-visible Delta node labels.
     fn device_name(&self) -> Option<String> {
         None
+    }
+    fn tmux_client_device_kind(&self) -> TmuxClientDeviceKind {
+        TmuxClientDeviceKind::Desktop
     }
     /// Returns the app's writable data directory for persisting workspace state.
     /// On iOS: Documents directory. On Android: internal files directory.

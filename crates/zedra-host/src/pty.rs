@@ -2,10 +2,12 @@
 // Uses portable-pty for cross-platform PTY support
 
 use crate::paths;
+#[cfg(windows)]
+use anyhow::Context;
 use anyhow::Result;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
-use zedra_rpc::proto::TerminalColorScheme;
+use zedra_rpc::proto::{TerminalColorScheme, TmuxClientDeviceKind};
 
 pub type PtyParts = (
     Box<dyn Read + Send>,
@@ -34,6 +36,29 @@ pub struct SpawnOptions {
     pub color_scheme: Option<TerminalColorScheme>,
     /// Extra environment variables set on the spawned shell after sanitization.
     pub env: Vec<(String, String)>,
+    /// Identity command for terminal cards when the PTY runs an outer wrapper
+    /// such as tmux attach. `None` keeps `launch_cmd` as the identity.
+    pub identity_launch_cmd: Option<String>,
+    /// Optional managed backing for terminals attached through tmux.
+    pub backing: Option<TerminalBacking>,
+}
+
+/// Which shared agent session a terminal belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedSpawnIdentity {
+    pub slug: String,
+    pub session_id: String,
+}
+
+/// Managed process backing for a terminal attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalBacking {
+    SharedAgent(SharedSpawnIdentity),
+    ExternalTmux {
+        session_name: String,
+        client_pubkey: [u8; 32],
+        device_kind: TmuxClientDeviceKind,
+    },
 }
 
 fn launch_script(launch_cmd: &str) -> String {
@@ -477,6 +502,7 @@ mod tests {
                 launch_cmd: Some("printf 'ZEDRA_LAUNCH_OK\\n'; exit".to_string()),
                 color_scheme: None,
                 env: Vec::new(),
+                ..Default::default()
             },
         )
         .unwrap();

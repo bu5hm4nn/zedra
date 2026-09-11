@@ -38,6 +38,8 @@ struct SessionHandleInner {
     fs_upload_rpc_supported: AtomicBool,
     set_app_state_rpc_supported: AtomicBool,
     remote_open_rpc_supported: AtomicBool,
+    shared_agent_rpc_supported: AtomicBool,
+    tmux_session_rpc_supported: AtomicBool,
     /// Runtime the terminal pump tasks spawn onto. Set by `Session::new` so
     /// `attach_remote` works even when a method is awaited from the GPUI thread.
     runtime: Mutex<Option<tokio::runtime::Handle>>,
@@ -79,6 +81,8 @@ impl SessionHandle {
             fs_upload_rpc_supported: AtomicBool::new(true),
             set_app_state_rpc_supported: AtomicBool::new(true),
             remote_open_rpc_supported: AtomicBool::new(true),
+            shared_agent_rpc_supported: AtomicBool::new(true),
+            tmux_session_rpc_supported: AtomicBool::new(true),
             runtime: Mutex::new(None),
         }))
     }
@@ -587,6 +591,22 @@ impl SessionHandle {
         self.downgrade_rpc(&self.0.remote_open_rpc_supported, "remote open", err)
     }
 
+    fn downgrade_shared_agent_rpc(&self, err: &str) -> bool {
+        self.downgrade_rpc(
+            &self.0.shared_agent_rpc_supported,
+            "shared agent sessions",
+            err,
+        )
+    }
+
+    fn downgrade_tmux_session_rpc(&self, err: &str) -> bool {
+        self.downgrade_rpc(
+            &self.0.tmux_session_rpc_supported,
+            "custom tmux sessions",
+            err,
+        )
+    }
+
     // ─── RPC: remote project opening ────────────────────────────────────
 
     /// True until an older host rejects one of the remote-open RPCs.
@@ -633,6 +653,167 @@ impl SessionHandle {
             },
             Err(error) => {
                 self.downgrade_remote_open_rpc(&error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    // ─── RPC: shared agent sessions ──────────────────────────────────────
+
+    /// True until an older host rejects one of the shared-session RPCs. Only
+    /// the shared-session calls disable on downgrade; every other agent or
+    /// terminal feature keeps working against the same host.
+    pub fn shared_agent_sessions_supported(&self) -> bool {
+        self.0.shared_agent_rpc_supported.load(Ordering::Acquire)
+    }
+
+    /// List the agent's live tmux-backed shared sessions. `available` is false
+    /// when the actor does not support shared sessions or tmux is unusable.
+    /// Persisted history remains unaffected.
+    pub async fn agent_share_list(&self, slug: String) -> Result<AgentShareListResult> {
+        if !self.shared_agent_sessions_supported() {
+            return Err(anyhow::anyhow!(
+                "shared agent sessions are unsupported by host"
+            ));
+        }
+        match self.call(AgentShareListReq { slug }).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.downgrade_shared_agent_rpc(&error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// Terminate one shared session: the agent process stops and every
+    /// attached terminal client disconnects. Returns the caller's terminal
+    /// ids that were attached so the client can clean up its cards.
+    pub async fn agent_share_terminate(
+        &self,
+        slug: String,
+        session_id: String,
+    ) -> Result<AgentShareTerminateResult> {
+        if !self.shared_agent_sessions_supported() {
+            return Err(anyhow::anyhow!(
+                "shared agent sessions are unsupported by host"
+            ));
+        }
+        match self.call(AgentShareTerminateReq { slug, session_id }).await {
+            Ok(result) => match result.error {
+                Some(error) => Err(anyhow::anyhow!(error)),
+                None => Ok(result),
+            },
+            Err(error) => {
+                self.downgrade_shared_agent_rpc(&error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    // ─── RPC: custom tmux sessions ──────────────────────────────────────
+
+    /// True until an older host rejects one of the custom tmux-session RPCs.
+    /// This capability is independent from owned shared-agent sessions.
+    pub fn tmux_sessions_supported(&self) -> bool {
+        self.0.tmux_session_rpc_supported.load(Ordering::Acquire)
+    }
+
+    pub async fn tmux_session_list(&self) -> Result<TmuxSessionListResult> {
+        if !self.tmux_sessions_supported() {
+            return Err(anyhow::anyhow!(
+                "custom tmux sessions are unsupported by host"
+            ));
+        }
+        match self.call(TmuxSessionListReq {}).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.downgrade_tmux_session_rpc(&error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn tmux_session_attach(
+        &self,
+        name: String,
+        cols: u16,
+        rows: u16,
+        device_kind: TmuxClientDeviceKind,
+    ) -> Result<String> {
+        if !self.tmux_sessions_supported() {
+            return Err(anyhow::anyhow!(
+                "custom tmux sessions are unsupported by host"
+            ));
+        }
+
+        // Creation and stream attachment must use the same client so clearing
+        // the handle during this operation cannot strand a host terminal.
+        let client = self.client()?;
+        let result: TmuxSessionAttachResult = match client
+            .rpc(TmuxSessionAttachReq {
+                name,
+                cols,
+                rows,
+                device_kind,
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let error = map_rpc_error(error);
+                self.downgrade_tmux_session_rpc(&error.to_string());
+                return Err(error);
+            }
+        };
+        if let Some(error) = result.error {
+            return Err(anyhow::anyhow!(error));
+        }
+
+        let terminal = RemoteTerminal::new(result.terminal_id.clone());
+        let attach_result = match self.runtime() {
+            Ok(runtime) => terminal.attach_remote(&client, &runtime).await,
+            Err(error) => Err(error),
+        };
+        match attach_result {
+            Ok(()) => {
+                self.add_terminal(terminal);
+                tracing::info!(
+                    "Custom tmux session attached in terminal: {}",
+                    result.terminal_id
+                );
+                Ok(result.terminal_id)
+            }
+            Err(error) => {
+                if let Err(close_error) = client
+                    .rpc(TermCloseReq {
+                        id: result.terminal_id.clone(),
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        terminal_id = %result.terminal_id,
+                        error = %map_rpc_error(close_error),
+                        "failed to close custom tmux terminal after attach failure"
+                    );
+                }
+                Err(anyhow::anyhow!("Failed to attach tmux terminal: {error}"))
+            }
+        }
+    }
+
+    pub async fn tmux_session_terminate(&self, name: String) -> Result<TmuxSessionTerminateResult> {
+        if !self.tmux_sessions_supported() {
+            return Err(anyhow::anyhow!(
+                "custom tmux sessions are unsupported by host"
+            ));
+        }
+        match self.call(TmuxSessionTerminateReq { name }).await {
+            Ok(result) => match result.error {
+                Some(error) => Err(anyhow::anyhow!(error)),
+                None => Ok(result),
+            },
+            Err(error) => {
+                self.downgrade_tmux_session_rpc(&error.to_string());
                 Err(error)
             }
         }
@@ -1253,5 +1434,221 @@ mod tests {
             ),
             "expected application close, got {close_reason:?}",
         );
+    }
+}
+#[cfg(test)]
+mod shared_agent_tests {
+    use super::*;
+
+    #[test]
+    fn shared_agent_downgrade_disables_only_new_calls() {
+        let handle = SessionHandle::new();
+        assert!(handle.shared_agent_sessions_supported());
+
+        // Simulate an old host rejecting the unknown variant.
+        assert!(handle.downgrade_shared_agent_rpc(
+            "postcard deserialize error: unknown variant `AgentShareList`"
+        ));
+        assert!(!handle.shared_agent_sessions_supported());
+        // Unrelated capabilities stay enabled for the same connection.
+        assert!(handle.remote_open_supported());
+        assert!(handle.0.fs_search_rpc_supported.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn one_shared_agent_downgrade_disables_both_slugs_only() {
+        let handle = SessionHandle::new();
+        assert!(handle.downgrade_shared_agent_rpc(
+            "postcard deserialize error: unknown variant `AgentShareList`"
+        ));
+
+        for slug in ["pi", "omp"] {
+            let list_error = handle
+                .agent_share_list(slug.into())
+                .await
+                .expect_err("disabled list call must fail fast");
+            assert!(list_error.to_string().contains("unsupported by host"));
+            let terminate_error = handle
+                .agent_share_terminate(slug.into(), "019e".into())
+                .await
+                .expect_err("disabled terminate call must fail fast");
+            assert!(terminate_error.to_string().contains("unsupported by host"));
+        }
+
+        for slug in ["pi", "omp"] {
+            let history_error = handle
+                .agent_sessions(slug.into(), false, 50)
+                .await
+                .expect_err("history RPC should remain enabled and reach the disconnected client");
+            assert!(history_error.to_string().contains("not connected"));
+        }
+        let terminal_error = handle
+            .terminal_list()
+            .await
+            .expect_err("terminal RPC should remain enabled and reach the disconnected client");
+        assert!(terminal_error.to_string().contains("not connected"));
+    }
+
+    #[test]
+    fn shared_agent_downgrade_ignores_transport_errors() {
+        let handle = SessionHandle::new();
+        // Not-connected / transport errors must not permanently disable the
+        // feature for the connection.
+        assert!(!handle.downgrade_shared_agent_rpc("not connected"));
+        assert!(handle.shared_agent_sessions_supported());
+    }
+}
+
+#[cfg(test)]
+mod tmux_session_tests {
+    use super::*;
+
+    #[test]
+    fn tmux_session_downgrade_is_isolated_from_existing_rpcs() {
+        let handle = SessionHandle::new();
+        assert!(handle.tmux_sessions_supported());
+        assert!(handle.downgrade_tmux_session_rpc(
+            "postcard deserialize error: unknown variant `TmuxSessionList`"
+        ));
+
+        assert!(!handle.tmux_sessions_supported());
+        assert!(handle.shared_agent_sessions_supported());
+        assert!(handle.remote_open_supported());
+        assert!(handle.0.fs_search_rpc_supported.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn tmux_session_downgrade_disables_only_custom_tmux_calls() {
+        let handle = SessionHandle::new();
+        assert!(handle.downgrade_tmux_session_rpc(
+            "postcard deserialize error: unknown variant `TmuxSessionList`"
+        ));
+
+        let list_error = handle
+            .tmux_session_list()
+            .await
+            .expect_err("disabled custom tmux list must fail fast");
+        assert!(list_error.to_string().contains("unsupported by host"));
+        let attach_error = handle
+            .tmux_session_attach("cars_us".into(), 80, 24, TmuxClientDeviceKind::Phone)
+            .await
+            .expect_err("disabled custom tmux attach must fail fast");
+        assert!(attach_error.to_string().contains("unsupported by host"));
+        let terminate_error = handle
+            .tmux_session_terminate("cars_us".into())
+            .await
+            .expect_err("disabled custom tmux terminate must fail fast");
+        assert!(terminate_error.to_string().contains("unsupported by host"));
+
+        let share_error = handle
+            .agent_share_list("pi".into())
+            .await
+            .expect_err("shared-agent RPC must remain enabled");
+        assert!(share_error.to_string().contains("not connected"));
+        let terminal_error = handle
+            .terminal_list()
+            .await
+            .expect_err("ordinary terminal RPC must remain enabled");
+        assert!(terminal_error.to_string().contains("not connected"));
+    }
+
+    #[test]
+    fn tmux_session_downgrade_ignores_transport_errors() {
+        let handle = SessionHandle::new();
+        assert!(!handle.downgrade_tmux_session_rpc("not connected"));
+        assert!(handle.tmux_sessions_supported());
+    }
+
+    #[tokio::test]
+    async fn tmux_attach_failure_closes_host_terminal_without_local_insertion() {
+        let handle = SessionHandle::new();
+        let (request_tx, mut request_rx) =
+            tokio::sync::mpsc::channel::<zedra_rpc::proto::ZedraMessage>(8);
+        handle.set_rpc_client(irpc::Client::<ZedraProto>::local(request_tx));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = tokio::spawn(async move {
+            while let Some(message) = request_rx.recv().await {
+                match message {
+                    zedra_rpc::proto::ZedraMessage::TmuxSessionAttach(message) => {
+                        event_tx.send("created").unwrap();
+                        message
+                            .tx
+                            .send(TmuxSessionAttachResult {
+                                terminal_id: "tmux-term-1".into(),
+                                error: None,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    zedra_rpc::proto::ZedraMessage::TermClose(message) => {
+                        assert_eq!(message.id, "tmux-term-1");
+                        event_tx.send("closed").unwrap();
+                        message.tx.send(TermCloseResult { ok: true }).await.unwrap();
+                        break;
+                    }
+                    _ => panic!("unexpected RPC"),
+                }
+            }
+        });
+
+        let error = handle
+            .tmux_session_attach("cars_us".into(), 80, 24, TmuxClientDeviceKind::Tablet)
+            .await
+            .expect_err("missing runtime must fail stream attachment");
+
+        assert!(error.to_string().contains("session handle has no runtime"));
+        assert!(handle.terminal_ids().is_empty());
+        assert_eq!(event_rx.recv().await, Some("created"));
+        assert_eq!(event_rx.recv().await, Some("closed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tmux_attach_inserts_terminal_only_after_stream_attach_starts() {
+        let handle = SessionHandle::new();
+        handle.set_runtime(tokio::runtime::Handle::current());
+        let (request_tx, mut request_rx) =
+            tokio::sync::mpsc::channel::<zedra_rpc::proto::ZedraMessage>(8);
+        handle.set_rpc_client(irpc::Client::<ZedraProto>::local(request_tx));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = tokio::spawn(async move {
+            while let Some(message) = request_rx.recv().await {
+                match message {
+                    zedra_rpc::proto::ZedraMessage::TmuxSessionAttach(message) => {
+                        event_tx.send("created").unwrap();
+                        message
+                            .tx
+                            .send(TmuxSessionAttachResult {
+                                terminal_id: "tmux-term-2".into(),
+                                error: None,
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    zedra_rpc::proto::ZedraMessage::TermAttach(message) => {
+                        event_tx.send("attached").unwrap();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            drop(message);
+                        });
+                        break;
+                    }
+                    _ => panic!("unexpected RPC"),
+                }
+            }
+        });
+
+        let terminal_id = handle
+            .tmux_session_attach("cars_us".into(), 80, 24, TmuxClientDeviceKind::Desktop)
+            .await
+            .unwrap();
+
+        assert_eq!(event_rx.recv().await, Some("created"));
+        assert_eq!(event_rx.recv().await, Some("attached"));
+        assert_eq!(terminal_id, "tmux-term-2");
+        assert_eq!(handle.terminal_ids(), vec!["tmux-term-2"]);
+        server.await.unwrap();
     }
 }

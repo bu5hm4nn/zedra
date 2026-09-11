@@ -7,12 +7,21 @@ use crate::platform_bridge::{
     NativeDictationPreviewOptions, NativeEditMenuItem, NativeFloatingButtonOptions,
     NativeNotificationOptions, PlatformBridge, SoundEffect, SystemTheme,
 };
+use zedra_rpc::proto::TmuxClientDeviceKind;
 
 pub struct AndroidBridge;
 
 impl PlatformBridge for AndroidBridge {
     fn density(&self) -> f32 {
         jni::get_density()
+    }
+
+    fn tmux_client_device_kind(&self) -> TmuxClientDeviceKind {
+        if jni::tmux_client_is_tablet() {
+            TmuxClientDeviceKind::Tablet
+        } else {
+            TmuxClientDeviceKind::Phone
+        }
     }
 
     fn system_inset_top(&self) -> u32 {

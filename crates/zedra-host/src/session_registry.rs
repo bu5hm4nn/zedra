@@ -10,6 +10,7 @@
 use crate::docs_tree::{
     snapshot_page_result, DocsTreeCacheEntry, DocsTreeSnapshot, DOCS_TREE_CACHE_TTL,
 };
+use crate::pty::TerminalBacking;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -22,7 +23,7 @@ use uuid::Uuid;
 use zedra_osc::{OscEvent, OscScanner};
 use zedra_rpc::proto::{
     AgentState, BacklogEntry, FsDocsTreeError, FsDocsTreeResult, HostEvent, SessionCloseReason,
-    TermOutput, TermShellState, TerminalSyncEntry,
+    TermOutput, TermShellState, TerminalSyncEntry, TmuxClientCounts, TmuxClientDeviceKind,
 };
 use zedra_rpc::verify_registration_hmac;
 
@@ -556,9 +557,29 @@ pub struct TermSession {
     pub created_at: SystemTime,
     /// Monotonic creation time for terminal uptime calculations.
     pub started_at: Instant,
+    /// Managed backing when this terminal attaches through tmux.
+    pub backing: Option<TerminalBacking>,
 }
 
 impl TermSession {
+    /// Whether this terminal belongs to the shared agent session
+    /// `(slug, session_id)`.
+    pub fn shared_matches(&self, slug: &str, session_id: &str) -> bool {
+        matches!(
+            self.backing.as_ref(),
+            Some(TerminalBacking::SharedAgent(shared))
+                if shared.slug == slug && shared.session_id == session_id
+        )
+    }
+
+    /// Whether this terminal attaches to the byte-exact external tmux session.
+    pub fn external_tmux_matches(&self, name: &str) -> bool {
+        matches!(
+            self.backing.as_ref(),
+            Some(TerminalBacking::ExternalTmux { session_name, .. }) if session_name == name
+        )
+    }
+
     pub fn terminate(mut self) -> bool {
         match self.child.try_wait() {
             Ok(Some(_)) => return true,
@@ -568,16 +589,36 @@ impl TermSession {
             }
         }
 
+        // portable-pty's `kill` only sends SIGHUP, which a shell can ignore
+        // while starting up, and a blocking wait on the dying child can wedge
+        // (observed on macOS). Poll with SIGKILL retries under a deadline so
+        // close and shared termination always return.
         if let Err(e) = self.child.kill() {
             tracing::warn!(err = %e, "failed to terminate terminal child");
-            return false;
         }
-
-        if let Err(e) = self.child.wait() {
-            tracing::warn!(err = %e, "failed to reap terminal child after close");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(e) => {
+                    // ECHILD means the child is already gone; treat as reaped.
+                    tracing::warn!(err = %e, "failed to reap terminal child after close");
+                    return true;
+                }
+            }
+            #[cfg(unix)]
+            if let Some(pid) = self.child.process_id() {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("terminal child did not die within 5s of SIGKILL");
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-
-        true
     }
 }
 
@@ -1381,6 +1422,54 @@ impl SessionRegistry {
             verify_registration_hmac(&slot.handshake_secret, client_pubkey, timestamp, hmac)
         })
     }
+    /// Count active Zedra viewers and otherwise-unidentified native tmux clients.
+    pub async fn external_tmux_client_counts(
+        &self,
+        name: &str,
+        session_attached: u32,
+    ) -> TmuxClientCounts {
+        let sessions: Vec<Arc<ServerSession>> =
+            self.sessions.lock().await.values().cloned().collect();
+        let mut host_children = 0u32;
+        let mut active_clients = HashMap::new();
+        for session in sessions {
+            let terminals = session.terminals.lock().await;
+            for terminal in terminals.values() {
+                let Some(TerminalBacking::ExternalTmux {
+                    session_name,
+                    client_pubkey,
+                    device_kind,
+                }) = terminal.backing.as_ref()
+                else {
+                    continue;
+                };
+                if session_name != name {
+                    continue;
+                }
+                host_children = host_children.saturating_add(1);
+                let active = terminal
+                    .output_sender
+                    .lock()
+                    .is_ok_and(|slot| slot.sender.is_some());
+                if active {
+                    active_clients.entry(*client_pubkey).or_insert(*device_kind);
+                }
+            }
+        }
+
+        let mut counts = TmuxClientCounts {
+            desktop: session_attached.saturating_sub(host_children),
+            ..TmuxClientCounts::default()
+        };
+        for device_kind in active_clients.into_values() {
+            match device_kind {
+                TmuxClientDeviceKind::Phone => counts.phone = counts.phone.saturating_add(1),
+                TmuxClientDeviceKind::Tablet => counts.tablet = counts.tablet.saturating_add(1),
+                TmuxClientDeviceKind::Desktop => counts.desktop = counts.desktop.saturating_add(1),
+            }
+        }
+        counts
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,6 +1689,56 @@ impl ServerSession {
         }
 
         terminal
+    }
+
+    /// Remove every terminal attached to the shared agent session
+    /// `(slug, session_id)` from `terminals` and `terminal_order`, returning
+    /// them in terminal order. Terminals for other sessions — shared or
+    /// plain — stay untouched.
+    pub async fn remove_shared_terminals(
+        &self,
+        slug: &str,
+        session_id: &str,
+    ) -> Vec<(String, TermSession)> {
+        let mut terms = self.terminals.lock().await;
+        let mut order = self.terminal_order.lock().await;
+        let ids: Vec<String> = order
+            .iter()
+            .filter(|id| {
+                terms
+                    .get(*id)
+                    .is_some_and(|t| t.shared_matches(slug, session_id))
+            })
+            .cloned()
+            .collect();
+        let removed: Vec<(String, TermSession)> = ids
+            .into_iter()
+            .filter_map(|id| terms.remove(&id).map(|terminal| (id, terminal)))
+            .collect();
+        order.retain(|id| terms.contains_key(id));
+        removed
+    }
+
+    /// Remove every terminal attached to the byte-exact external tmux session,
+    /// returning them in terminal order without touching plain or shared terminals.
+    pub async fn remove_external_tmux_terminals(&self, name: &str) -> Vec<(String, TermSession)> {
+        let mut terms = self.terminals.lock().await;
+        let mut order = self.terminal_order.lock().await;
+        let ids: Vec<String> = order
+            .iter()
+            .filter(|id| {
+                terms
+                    .get(*id)
+                    .is_some_and(|terminal| terminal.external_tmux_matches(name))
+            })
+            .cloned()
+            .collect();
+        let removed: Vec<(String, TermSession)> = ids
+            .into_iter()
+            .filter_map(|id| terms.remove(&id).map(|terminal| (id, terminal)))
+            .collect();
+        order.retain(|id| terms.contains_key(id));
+        removed
     }
 
     pub async fn reorder_terminals(&self, ordered_ids: Vec<String>) -> Result<(), String> {
@@ -1870,6 +2009,244 @@ mod tests {
 
     fn make_pubkey(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    fn terminal(backing: Option<TerminalBacking>) -> TermSession {
+        let shell = crate::pty::ShellSession::spawn(
+            80,
+            24,
+            crate::pty::SpawnOptions {
+                launch_cmd: Some("exit 0".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_reader, writer, master, child) = shell.take_reader();
+        TermSession {
+            writer: Arc::new(std::sync::Mutex::new(writer)),
+            master,
+            child,
+            output_sender: Arc::new(std::sync::Mutex::new(OutputSenderSlot {
+                gen: 0,
+                sender: None,
+            })),
+            host_meta: Arc::new(std::sync::Mutex::new(HostTermMeta::default())),
+            backlog: Arc::new(std::sync::Mutex::new(TermBacklog::new())),
+            created_at: SystemTime::now(),
+            started_at: Instant::now(),
+            backing,
+        }
+    }
+
+    fn shared_backing(slug: &str, session_id: &str) -> TerminalBacking {
+        TerminalBacking::SharedAgent(crate::pty::SharedSpawnIdentity {
+            slug: slug.to_string(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn external_backing(session_name: &str) -> TerminalBacking {
+        TerminalBacking::ExternalTmux {
+            session_name: session_name.to_string(),
+            client_pubkey: make_pubkey(1),
+            device_kind: TmuxClientDeviceKind::Desktop,
+        }
+    }
+
+    fn external_backing_for(
+        session_name: &str,
+        client_pubkey: [u8; 32],
+        device_kind: TmuxClientDeviceKind,
+    ) -> TerminalBacking {
+        TerminalBacking::ExternalTmux {
+            session_name: session_name.to_string(),
+            client_pubkey,
+            device_kind,
+        }
+    }
+
+    fn active_terminal(
+        backing: TerminalBacking,
+    ) -> (TermSession, tokio::sync::mpsc::Receiver<TermOutput>) {
+        let terminal = terminal(Some(backing));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        if let Ok(mut slot) = terminal.output_sender.lock() {
+            slot.sender = Some(sender);
+        }
+        (terminal, receiver)
+    }
+
+    #[test]
+    fn terminal_backing_matching_is_isolated_and_exact() {
+        let shared = terminal(Some(shared_backing("pi", "cars_us")));
+        assert!(shared.shared_matches("pi", "cars_us"));
+        assert!(!shared.shared_matches("pi", "cars"));
+        assert!(!shared.external_tmux_matches("cars_us"));
+        assert!(shared.terminate());
+
+        let external = terminal(Some(external_backing("cars_us")));
+        assert!(external.external_tmux_matches("cars_us"));
+        assert!(!external.external_tmux_matches("cars"));
+        assert!(!external.external_tmux_matches("cars_us "));
+        assert!(!external.shared_matches("pi", "cars_us"));
+        assert!(external.terminate());
+
+        let plain = terminal(None);
+        assert!(!plain.external_tmux_matches("cars_us"));
+        assert!(!plain.shared_matches("pi", "cars_us"));
+        assert!(plain.terminate());
+    }
+
+    #[tokio::test]
+    async fn external_tmux_cleanup_removes_only_exact_backing_in_terminal_order() {
+        let registry = SessionRegistry::new();
+        let session = create_session(&registry).await;
+        for (id, backing) in [
+            ("external-a", Some(external_backing("cars_us"))),
+            ("prefix", Some(external_backing("cars_us-old"))),
+            ("external-b", Some(external_backing("cars_us"))),
+            ("shared", Some(shared_backing("pi", "cars_us"))),
+            ("plain", None),
+        ] {
+            session
+                .insert_terminal(id.to_string(), terminal(backing))
+                .await;
+        }
+
+        let removed = session.remove_external_tmux_terminals("cars_us").await;
+        assert_eq!(
+            removed
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["external-a", "external-b"]
+        );
+        assert!(removed
+            .into_iter()
+            .all(|(_, terminal)| terminal.terminate()));
+
+        assert_eq!(
+            session.terminal_ids().await,
+            vec![
+                "prefix".to_string(),
+                "shared".to_string(),
+                "plain".to_string(),
+            ]
+        );
+        for id in ["prefix", "shared", "plain"] {
+            assert!(session.remove_terminal(id).await.unwrap().terminate());
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tmux_presence_deduplicates_devices_across_server_sessions() {
+        let registry = SessionRegistry::new();
+        let first = registry
+            .create_named("presence-a", PathBuf::from("/tmp"))
+            .await;
+        let second = registry
+            .create_named("presence-b", PathBuf::from("/tmp"))
+            .await;
+        let phone_key = make_pubkey(11);
+        let tablet_key = make_pubkey(12);
+        let (phone_a, _phone_a_rx) = active_terminal(external_backing_for(
+            "cars_us",
+            phone_key,
+            TmuxClientDeviceKind::Phone,
+        ));
+        let (phone_b, _phone_b_rx) = active_terminal(external_backing_for(
+            "cars_us",
+            phone_key,
+            TmuxClientDeviceKind::Phone,
+        ));
+        let (tablet, _tablet_rx) = active_terminal(external_backing_for(
+            "cars_us",
+            tablet_key,
+            TmuxClientDeviceKind::Tablet,
+        ));
+        first.insert_terminal("phone-a".into(), phone_a).await;
+        second.insert_terminal("phone-b".into(), phone_b).await;
+        second.insert_terminal("tablet".into(), tablet).await;
+
+        assert_eq!(
+            registry.external_tmux_client_counts("cars_us", 3).await,
+            TmuxClientCounts {
+                phone: 1,
+                tablet: 1,
+                desktop: 0,
+            }
+        );
+        for (session, ids) in [
+            (&first, ["phone-a"].as_slice()),
+            (&second, ["phone-b", "tablet"].as_slice()),
+        ] {
+            for id in ids {
+                assert!(session.remove_terminal(id).await.unwrap().terminate());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tmux_presence_separates_inactive_and_unmanaged_clients() {
+        let registry = SessionRegistry::new();
+        assert_eq!(
+            registry.external_tmux_client_counts("cars_us", 2).await,
+            TmuxClientCounts {
+                phone: 0,
+                tablet: 0,
+                desktop: 2,
+            }
+        );
+
+        let session = registry
+            .create_named("presence-mixed", PathBuf::from("/tmp"))
+            .await;
+        let (phone, _phone_rx) = active_terminal(external_backing_for(
+            "cars_us",
+            make_pubkey(21),
+            TmuxClientDeviceKind::Phone,
+        ));
+        session.insert_terminal("phone".into(), phone).await;
+        session
+            .insert_terminal(
+                "inactive-tablet".into(),
+                terminal(Some(external_backing_for(
+                    "cars_us",
+                    make_pubkey(22),
+                    TmuxClientDeviceKind::Tablet,
+                ))),
+            )
+            .await;
+        session
+            .insert_terminal(
+                "other".into(),
+                terminal(Some(external_backing_for(
+                    "other",
+                    make_pubkey(23),
+                    TmuxClientDeviceKind::Desktop,
+                ))),
+            )
+            .await;
+
+        assert_eq!(
+            registry.external_tmux_client_counts("cars_us", 4).await,
+            TmuxClientCounts {
+                phone: 1,
+                tablet: 0,
+                desktop: 2,
+            }
+        );
+        assert_eq!(
+            registry.external_tmux_client_counts("cars_us", 0).await,
+            TmuxClientCounts {
+                phone: 1,
+                tablet: 0,
+                desktop: 0,
+            }
+        );
+        for id in ["phone", "inactive-tablet", "other"] {
+            assert!(session.remove_terminal(id).await.unwrap().terminate());
+        }
     }
 
     fn active_connection(pubkey: [u8; 32]) -> ActiveClientConnection {

@@ -9,7 +9,9 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::*;
 use uuid::Uuid;
 use zedra_rpc::ZedraPairingTicket;
-use zedra_rpc::proto::{HostEvent, SyncSessionResult};
+use zedra_rpc::proto::{
+    AgentShareTerminateResult, HostEvent, SyncSessionResult, TmuxSessionTerminateResult,
+};
 use zedra_session::{
     ConnectEvent, ConnectPhase, ConnectSnapshot, ReconnectReason, Session, SessionHandle,
     SessionState, signer::ClientSigner,
@@ -34,11 +36,12 @@ use crate::ui::{DrawerEvent, DrawerHost, DrawerSide};
 use crate::web_tunnel_opening::WebTunnelOpening;
 use crate::workspace_action::{self, GoHome, OpenFileSearch, OpenQuickAction, RequestDisconnect};
 use crate::workspace_action::{
-    AddSelectionToChat, CloseDrawer, CloseTerminal, CloseWebClient, CreateAgent, CreateNewTerminal,
-    GitCommit, GitShowItemActions, GitStage, GitUnstage, HideConnecting, NavigateBack,
-    OpenAgentDetail, OpenAgentManage, OpenAgentSessions, OpenDrawer, OpenFile, OpenGitDiff,
-    OpenTerminal, OpenWebClient, RestartConnection, ResumeAgentSession, RevealInFileExplorer,
-    ShowConnecting, SpawnAgentTerminal, SpawnAgentWebClient, ToggleDrawer,
+    AddSelectionToChat, AttachTmuxSession, CloseDrawer, CloseTerminal, CloseWebClient, CreateAgent,
+    CreateNewTerminal, GitCommit, GitShowItemActions, GitStage, GitUnstage, HideConnecting,
+    ManageTmuxSession, NavigateBack, OpenAgentDetail, OpenAgentManage, OpenAgentSessions,
+    OpenDrawer, OpenFile, OpenGitDiff, OpenTerminal, OpenWebClient, RestartConnection,
+    ResumeAgentSession, RevealInFileExplorer, ShowConnecting, SpawnAgentTerminal,
+    SpawnAgentWebClient, TerminateSharedAgentSession, ToggleDrawer,
 };
 use crate::workspace_connecting::WorkspaceConnecting;
 use crate::workspace_connection_banner::{BannerEvent, ConnectionBanner};
@@ -163,6 +166,16 @@ pub(crate) enum PendingWorkspaceAction {
     },
     SpawnAgentWebClient {
         slug: String,
+    },
+    TerminateSharedAgentSession {
+        slug: String,
+        session_id: String,
+    },
+    ConfirmTerminateTmuxSession {
+        name: String,
+    },
+    TerminateTmuxSession {
+        name: String,
     },
 }
 
@@ -733,10 +746,85 @@ fn seed_pending_launch_terminal_meta(
         terminal_state.set_current_command(terminal_id, command.to_owned());
         terminal_state.set_shell_running(terminal_id);
     }
-    // When the launcher knows the agent (resume flow), seed identity directly for
-    // an instant icon; otherwise it arrives via the host TerminalAgentChanged.
+    // When the launcher knows the agent, seed identity directly for an instant
+    // icon; otherwise it arrives via the host TerminalAgentChanged.
     if let Some(slug) = agent_slug {
         terminal_state.set_agent_slug(terminal_id, Some(slug.to_owned()));
+    }
+}
+
+const ATTACH_TMUX_SESSION_ALERT_TITLE: &str = "Attach Tmux Session";
+const TERMINATE_TMUX_SESSION_CONFIRMATION_TITLE: &str = "Terminate tmux session?";
+const TERMINATE_TMUX_SESSION_ALERT_TITLE: &str = "Terminate Tmux Session";
+
+fn tmux_attach_failure_message(error: &str) -> String {
+    format!("Failed to attach to the tmux session.\n\n{error}")
+}
+
+fn tmux_termination_confirmation_message(name: &str) -> String {
+    format!("This stops every process in “{name}” and disconnects every attached terminal.")
+}
+
+fn tmux_termination_failure_message(error: &str) -> String {
+    format!("Failed to terminate the tmux session.\n\n{error}")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FailedTmuxAttachDisposition {
+    RestorePrevious { active_terminal_id: Option<String> },
+    RemoveBackgroundRoute,
+}
+
+fn cleanup_failed_tmux_attach_state(
+    terminal_state: &mut TerminalState,
+    pending_was_active: bool,
+    previous_active_terminal_id: Option<String>,
+    previous_terminal_still_exists: bool,
+) -> FailedTmuxAttachDisposition {
+    terminal_state.remove(TERMINAL_PENDING_ID);
+
+    if pending_was_active {
+        FailedTmuxAttachDisposition::RestorePrevious {
+            active_terminal_id: previous_active_terminal_id
+                .filter(|_| previous_terminal_still_exists),
+        }
+    } else {
+        FailedTmuxAttachDisposition::RemoveBackgroundRoute
+    }
+}
+
+fn manage_tmux_session_pending_action(
+    selection: Option<usize>,
+    name: String,
+) -> Option<PendingWorkspaceAction> {
+    (selection == Some(0)).then_some(PendingWorkspaceAction::ConfirmTerminateTmuxSession { name })
+}
+
+fn confirm_tmux_termination_pending_action(
+    button_index: usize,
+    name: String,
+) -> Option<PendingWorkspaceAction> {
+    (button_index == 0).then_some(PendingWorkspaceAction::TerminateTmuxSession { name })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TmuxTerminationDisposition {
+    CloseTerminals(Vec<String>),
+    ShowFailure(String),
+}
+
+fn tmux_termination_disposition(
+    outcome: AnyhowResult<TmuxSessionTerminateResult>,
+) -> TmuxTerminationDisposition {
+    match outcome {
+        Ok(TmuxSessionTerminateResult {
+            terminal_ids,
+            error: None,
+        }) => TmuxTerminationDisposition::CloseTerminals(terminal_ids),
+        Ok(TmuxSessionTerminateResult {
+            error: Some(error), ..
+        }) => TmuxTerminationDisposition::ShowFailure(error),
+        Err(error) => TmuxTerminationDisposition::ShowFailure(error.to_string()),
     }
 }
 
@@ -2174,7 +2262,13 @@ impl Workspace {
                 }
             }
             WorkspaceMainView::AgentSessions => {
-                let view = cx.new(|cx| AgentSessions::new(self.session.handle().clone(), cx));
+                let view = cx.new(|cx| {
+                    AgentSessions::new(
+                        self.session.handle().clone(),
+                        self.workspace_state.clone(),
+                        cx,
+                    )
+                });
                 self.content.update(cx, move |content, cx| {
                     content.clear_subtitle(cx);
                     content.set_main_view(view.into(), cx);
@@ -2670,6 +2764,288 @@ impl Workspace {
         self.resume_agent_session(action.slug.clone(), action.session_id.clone(), window, cx);
     }
 
+    fn handle_attach_tmux_session(
+        &mut self,
+        action: &AttachTmuxSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        info!(
+            session_name = action.name,
+            "handle AttachTmuxSession from workspace"
+        );
+        self.attach_tmux_session(action.name.clone(), action.agent_slug.clone(), window, cx);
+    }
+
+    fn handle_manage_tmux_session(
+        &mut self,
+        action: &ManageTmuxSession,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        info!(
+            session_name = action.name,
+            "handle ManageTmuxSession from workspace"
+        );
+        let title = action.name.clone();
+        let name = action.name.clone();
+        let pending_platform_action = self.pending_platform_action.clone();
+        platform_bridge::show_selection(
+            &title,
+            "",
+            vec![
+                AlertButton::destructive("Terminate Session"),
+                AlertButton::cancel("Cancel"),
+            ],
+            move |selection| {
+                if let Some(action) = manage_tmux_session_pending_action(selection, name.clone()) {
+                    pending_platform_action.set(action);
+                }
+            },
+        );
+    }
+
+    fn attach_tmux_session(
+        &mut self,
+        name: String,
+        agent_slug: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_handle = self.session.handle().clone();
+        let previous_active_terminal_id = self.workspace_state.read(cx).active_terminal_id.clone();
+        let initial_viewport = self.mainview_viewport(window, cx);
+        let initial_grid_size = TerminalView::compute_grid_size(window, initial_viewport);
+        let cols = initial_grid_size.columns;
+        let rows = initial_grid_size.rows;
+        let device_kind = platform_bridge::bridge().tmux_client_device_kind();
+        let workspace_terminal =
+            self.create_terminal_entity(TERMINAL_PENDING_ID.to_string(), window, cx);
+        let pending_entity_id = workspace_terminal.entity_id();
+        let pending_title = format!("Attaching {name}…");
+        self.terminal_state.update(cx, |state, cx| {
+            seed_pending_launch_terminal_meta(
+                state,
+                TERMINAL_PENDING_ID,
+                pending_title.clone(),
+                None,
+                agent_slug.as_deref(),
+            );
+            cx.notify();
+        });
+        self.navigate_to(
+            WorkspaceMainView::Terminal {
+                id: TERMINAL_PENDING_ID.to_string(),
+            },
+            cx,
+        );
+
+        cx.spawn(async move |workspace, cx| {
+            let terminal_id = match session_handle
+                .tmux_session_attach(name.clone(), cols as u16, rows as u16, device_kind)
+                .await
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::error!(session_name = name, "tmux session attach failed: {error}");
+                    let message = tmux_attach_failure_message(&error.to_string());
+                    let _ = workspace.update(cx, |ws, cx| {
+                        ws.terminals
+                            .retain(|terminal| terminal.entity_id() != pending_entity_id);
+                        let pending_was_active = ws.active_route_is_pending_terminal(cx);
+                        let previous_terminal_still_exists = previous_active_terminal_id
+                            .as_deref()
+                            .is_some_and(|id| ws.terminal_by_id(id, cx).is_some());
+                        let disposition = ws.terminal_state.update(cx, |state, cx| {
+                            let disposition = cleanup_failed_tmux_attach_state(
+                                state,
+                                pending_was_active,
+                                previous_active_terminal_id,
+                                previous_terminal_still_exists,
+                            );
+                            cx.notify();
+                            disposition
+                        });
+                        match disposition {
+                            FailedTmuxAttachDisposition::RestorePrevious { active_terminal_id } => {
+                                if !ws.navigate_back(cx) {
+                                    ws.remove_terminal_route(TERMINAL_PENDING_ID, cx);
+                                    ws.navigate_to(WorkspaceMainView::Default, cx);
+                                }
+                                ws.workspace_state.update(cx, |state, cx| {
+                                    state.active_terminal_id = active_terminal_id;
+                                    cx.notify();
+                                });
+                            }
+                            FailedTmuxAttachDisposition::RemoveBackgroundRoute => {
+                                ws.remove_terminal_route(TERMINAL_PENDING_ID, cx);
+                            }
+                        }
+                        platform_bridge::show_alert(
+                            ATTACH_TMUX_SESSION_ALERT_TITLE,
+                            &message,
+                            vec![AlertButton::default("OK")],
+                            |_| {},
+                        );
+                    });
+                    return;
+                }
+            };
+
+            let _ = workspace.update(cx, |ws, cx| {
+                ws.terminal_state.update(cx, |state, cx| {
+                    seed_pending_launch_terminal_meta(
+                        state,
+                        &terminal_id,
+                        pending_title,
+                        None,
+                        agent_slug.as_deref(),
+                    );
+                    state.remove(TERMINAL_PENDING_ID);
+                    cx.notify();
+                });
+                workspace_terminal.update(cx, |terminal, cx| {
+                    terminal.set_terminal_id(terminal_id.clone(), cx);
+                });
+                ws.workspace_state.update(cx, |_state, cx| {
+                    cx.emit(WorkspaceStateEvent::TerminalCreated {
+                        id: terminal_id.clone(),
+                    });
+                });
+                if ws.active_route_is_pending_terminal(cx) {
+                    ws.replace_current_route(WorkspaceMainView::Terminal { id: terminal_id }, cx);
+                } else {
+                    ws.remove_terminal_route(TERMINAL_PENDING_ID, cx);
+                    ws.navigate_to(WorkspaceMainView::Terminal { id: terminal_id }, cx);
+                }
+                let terminal_count = ws.workspace_state.read(cx).terminal_ids.len();
+                zedra_telemetry::send(zedra_telemetry::Event::TerminalOpened {
+                    source: "attach_tmux",
+                    terminal_count,
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn request_tmux_session_termination_confirmation(&self, name: String) {
+        let message = tmux_termination_confirmation_message(&name);
+        let pending_platform_action = self.pending_platform_action.clone();
+        platform_bridge::show_alert(
+            TERMINATE_TMUX_SESSION_CONFIRMATION_TITLE,
+            &message,
+            vec![
+                AlertButton::destructive("Terminate"),
+                AlertButton::cancel("Cancel"),
+            ],
+            move |button_index| {
+                if let Some(action) =
+                    confirm_tmux_termination_pending_action(button_index, name.clone())
+                {
+                    pending_platform_action.set(action);
+                }
+            },
+        );
+    }
+
+    fn finish_terminate_tmux_session(
+        &mut self,
+        name: String,
+        outcome: AnyhowResult<TmuxSessionTerminateResult>,
+        cx: &mut Context<Self>,
+    ) {
+        match tmux_termination_disposition(outcome) {
+            TmuxTerminationDisposition::CloseTerminals(terminal_ids) => {
+                for id in terminal_ids {
+                    self.close_terminal_by_id(id, cx);
+                }
+            }
+            TmuxTerminationDisposition::ShowFailure(error) => {
+                tracing::error!(
+                    session_name = name,
+                    "tmux session termination failed: {error}"
+                );
+                platform_bridge::show_alert(
+                    TERMINATE_TMUX_SESSION_ALERT_TITLE,
+                    &tmux_termination_failure_message(&error),
+                    vec![AlertButton::default("OK")],
+                    |_| {},
+                );
+            }
+        }
+    }
+
+    fn handle_terminate_shared_agent_session(
+        &mut self,
+        action: &TerminateSharedAgentSession,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        info!(
+            agent = action.slug,
+            session_id = %action.session_id,
+            "handle TerminateSharedAgentSession from workspace"
+        );
+        let slug = action.slug.clone();
+        let session_id = action.session_id.clone();
+        let pending_platform_action = self.pending_platform_action.clone();
+        platform_bridge::show_alert(
+            "Terminate shared session?",
+            "This stops the agent session and disconnects every attached terminal.",
+            vec![
+                AlertButton::destructive("Terminate"),
+                AlertButton::cancel("Cancel"),
+            ],
+            move |button_index| {
+                if button_index == 0 {
+                    pending_platform_action.set(
+                        PendingWorkspaceAction::TerminateSharedAgentSession {
+                            slug: slug.clone(),
+                            session_id: session_id.clone(),
+                        },
+                    );
+                }
+            },
+        );
+    }
+
+    /// Apply an explicit shared-session termination. The host already stopped
+    /// the agent and reaped the terminal children, so local cards go through
+    /// the normal close path and the row falls back to persisted history; any
+    /// failure keeps every card and surfaces the host's exact reason.
+    fn finish_terminate_shared_agent_session(
+        &mut self,
+        slug: String,
+        session_id: String,
+        outcome: AnyhowResult<AgentShareTerminateResult>,
+        cx: &mut Context<Self>,
+    ) {
+        let (terminal_ids, host_error) = match outcome {
+            Ok(result) => (result.terminal_ids, result.error),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let Some(error) = host_error else {
+            for id in terminal_ids {
+                self.close_terminal_by_id(id, cx);
+            }
+            self.workspace_state.update(cx, |state, cx| {
+                state.remove_shared_session(&slug, &session_id, cx);
+            });
+            return;
+        };
+        tracing::error!(
+            agent = slug,
+            session_id = session_id,
+            "shared agent session termination failed: {error}"
+        );
+        platform_bridge::show_alert(
+            "Terminate Session",
+            &format!("Failed to terminate the shared session.\n\n{error}"),
+            vec![AlertButton::default("OK")],
+            |_| {},
+        );
+    }
+
     fn resume_agent_session(
         &mut self,
         slug: String,
@@ -2711,6 +3087,9 @@ impl Workspace {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::error!(agent = slug, "agent session resume failed: {}", e);
+                    // Host errors are actionable (missing/old tmux, prepare
+                    // failure); show the reason, not just the failure.
+                    let message = format!("Failed to resume the agent session.\n\n{e}");
                     let _ = workspace.update(cx, |ws, cx| {
                         ws.terminals.retain(|t| t.entity_id() != pending_entity_id);
                         ws.terminal_state.update(cx, |state, cx| {
@@ -2724,7 +3103,7 @@ impl Workspace {
                         }
                         platform_bridge::show_alert(
                             "Resume Agent",
-                            "Failed to resume the agent session.",
+                            &message,
                             vec![AlertButton::default("OK")],
                             |_| {},
                         );
@@ -3135,6 +3514,32 @@ impl Workspace {
                 })
                 .detach();
             }
+            PendingWorkspaceAction::TerminateSharedAgentSession { slug, session_id } => {
+                let handle = self.session.handle().clone();
+                cx.spawn(async move |workspace, cx| {
+                    // Fails fast against a downgraded old host instead of hanging.
+                    let outcome = handle
+                        .agent_share_terminate(slug.clone(), session_id.clone())
+                        .await;
+                    let _ = workspace.update(cx, |ws, cx| {
+                        ws.finish_terminate_shared_agent_session(slug, session_id, outcome, cx);
+                    });
+                })
+                .detach();
+            }
+            PendingWorkspaceAction::ConfirmTerminateTmuxSession { name } => {
+                self.request_tmux_session_termination_confirmation(name);
+            }
+            PendingWorkspaceAction::TerminateTmuxSession { name } => {
+                let handle = self.session.handle().clone();
+                cx.spawn(async move |workspace, cx| {
+                    let outcome = handle.tmux_session_terminate(name.clone()).await;
+                    let _ = workspace.update(cx, |ws, cx| {
+                        ws.finish_terminate_tmux_session(name, outcome, cx);
+                    });
+                })
+                .detach();
+            }
         }
     }
 
@@ -3323,6 +3728,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::handle_open_agent_manage))
             .on_action(cx.listener(Self::handle_open_agent_detail))
             .on_action(cx.listener(Self::handle_resume_agent_session))
+            .on_action(cx.listener(Self::handle_attach_tmux_session))
+            .on_action(cx.listener(Self::handle_manage_tmux_session))
+            .on_action(cx.listener(Self::handle_terminate_shared_agent_session))
             .on_action(cx.listener(Self::handle_open_terminal))
             .on_action(cx.listener(Self::handle_close_terminal))
             .on_action(cx.listener(Self::handle_open_web_client))
@@ -3701,6 +4109,159 @@ mod tests {
         // without waiting for a reconnect or OSC identity change.
         assert_eq!(meta.agent_slug.as_deref(), Some("codex"));
         assert_eq!(meta.agent_icon.as_deref(), Some("icons/openai.svg"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn failed_tmux_attach_clears_pending_state_and_restores_live_terminal() {
+        let mut terminal_state = TerminalState::new();
+        seed_pending_launch_terminal_meta(
+            &mut terminal_state,
+            TERMINAL_PENDING_ID,
+            "Attaching cars_us…".to_string(),
+            None,
+            Some("pi"),
+        );
+
+        let disposition = cleanup_failed_tmux_attach_state(
+            &mut terminal_state,
+            true,
+            Some("terminal-before-attach".to_string()),
+            true,
+        );
+
+        assert_eq!(
+            disposition,
+            FailedTmuxAttachDisposition::RestorePrevious {
+                active_terminal_id: Some("terminal-before-attach".to_string()),
+            }
+        );
+        let pending_meta = terminal_state.meta(TERMINAL_PENDING_ID);
+        assert_eq!(pending_meta.title, None);
+        assert_eq!(pending_meta.agent_slug, None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn failed_tmux_attach_does_not_restore_a_terminal_that_disappeared() {
+        let mut terminal_state = TerminalState::new();
+        seed_pending_launch_terminal_meta(
+            &mut terminal_state,
+            TERMINAL_PENDING_ID,
+            "Attaching cars_us…".to_string(),
+            None,
+            None,
+        );
+
+        let disposition = cleanup_failed_tmux_attach_state(
+            &mut terminal_state,
+            true,
+            Some("stale-terminal".to_string()),
+            false,
+        );
+
+        assert_eq!(
+            disposition,
+            FailedTmuxAttachDisposition::RestorePrevious {
+                active_terminal_id: None,
+            }
+        );
+        assert_eq!(terminal_state.meta(TERMINAL_PENDING_ID).title, None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn failed_tmux_attach_only_removes_background_pending_route() {
+        let mut terminal_state = TerminalState::new();
+        seed_pending_launch_terminal_meta(
+            &mut terminal_state,
+            TERMINAL_PENDING_ID,
+            "Attaching cars_us…".to_string(),
+            None,
+            None,
+        );
+
+        let disposition = cleanup_failed_tmux_attach_state(&mut terminal_state, false, None, false);
+
+        assert_eq!(
+            disposition,
+            FailedTmuxAttachDisposition::RemoveBackgroundRoute
+        );
+        assert_eq!(terminal_state.meta(TERMINAL_PENDING_ID).title, None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn tmux_manage_menu_cancel_is_a_noop_and_terminate_requests_confirmation() {
+        assert!(manage_tmux_session_pending_action(None, "cars_us".into()).is_none());
+        assert!(manage_tmux_session_pending_action(Some(1), "cars_us".into()).is_none());
+
+        match manage_tmux_session_pending_action(Some(0), "cars_us".into()) {
+            Some(PendingWorkspaceAction::ConfirmTerminateTmuxSession { name }) => {
+                assert_eq!(name, "cars_us");
+            }
+            _ => panic!("terminate selection must request confirmation"),
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn tmux_termination_confirmation_cancel_is_a_noop() {
+        assert!(confirm_tmux_termination_pending_action(1, "cars_us".into()).is_none());
+
+        match confirm_tmux_termination_pending_action(0, "cars_us".into()) {
+            Some(PendingWorkspaceAction::TerminateTmuxSession { name }) => {
+                assert_eq!(name, "cars_us");
+            }
+            _ => panic!("confirmation must schedule termination"),
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn tmux_termination_success_closes_only_returned_terminal_cards() {
+        let disposition = tmux_termination_disposition(Ok(TmuxSessionTerminateResult {
+            terminal_ids: vec!["attach-a".into(), "attach-b".into()],
+            error: None,
+        }));
+
+        assert_eq!(
+            disposition,
+            TmuxTerminationDisposition::CloseTerminals(vec!["attach-a".into(), "attach-b".into()])
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn tmux_termination_failure_keeps_returned_terminal_cards() {
+        let disposition = tmux_termination_disposition(Ok(TmuxSessionTerminateResult {
+            terminal_ids: vec!["attach-a".into()],
+            error: Some("tmux refused the request".into()),
+        }));
+
+        assert_eq!(
+            disposition,
+            TmuxTerminationDisposition::ShowFailure("tmux refused the request".into())
+        );
+        assert_eq!(
+            tmux_termination_disposition(Err(::anyhow::anyhow!("connection lost"))),
+            TmuxTerminationDisposition::ShowFailure("connection lost".into())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn tmux_lifecycle_alert_copy_matches_the_native_contract() {
+        assert_eq!(ATTACH_TMUX_SESSION_ALERT_TITLE, "Attach Tmux Session");
+        assert_eq!(
+            tmux_attach_failure_message("session disappeared"),
+            "Failed to attach to the tmux session.\n\nsession disappeared"
+        );
+        assert_eq!(
+            TERMINATE_TMUX_SESSION_CONFIRMATION_TITLE,
+            "Terminate tmux session?"
+        );
+        assert_eq!(
+            tmux_termination_confirmation_message("cars_us"),
+            "This stops every process in “cars_us” and disconnects every attached terminal."
+        );
+        assert_eq!(TERMINATE_TMUX_SESSION_ALERT_TITLE, "Terminate Tmux Session");
+        assert_eq!(
+            tmux_termination_failure_message("permission denied"),
+            "Failed to terminate the tmux session.\n\npermission denied"
+        );
     }
 
     #[::core::prelude::v1::test]

